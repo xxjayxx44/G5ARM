@@ -74,9 +74,9 @@ static void selectAlgo(unsigned char nibble, bool* selectedAlgos, uint8_t* selec
         }
 }
 
-static void getAlgoString(void *mem, unsigned int size, uint8_t* selectedAlgoOutput, int algoCount) {
+static void getAlgoString(const void *mem, unsigned int size, uint8_t* selectedAlgoOutput, int algoCount) {
   int i;
-  unsigned char *p = (unsigned char *)mem;
+  const unsigned char *p = (const unsigned char *)mem;
   unsigned int len = size/2;
   unsigned char j = 0;
   bool selectedAlgo[algoCount];
@@ -168,22 +168,22 @@ void mike_hash(const char* input, char* output, uint32_t len) {
                 switch(cnAlgo)
                 {
                  case CNDark:
-                        cryptonightdark_hash(in, hash, size, 1);
+                        cryptonightdark_hash(in, (char*)hash, size, 1);
                         break;
                  case CNDarklite:
-                        cryptonightdarklite_hash(in, hash, size, 1);
+                        cryptonightdarklite_hash(in, (char*)hash, size, 1);
                         break;
                  case CNFast:
-                        cryptonightfast_hash(in, hash, size, 1);
+                        cryptonightfast_hash(in, (char*)hash, size, 1);
                         break;
                  case CNLite:
-                        cryptonightlite_hash(in, hash, size, 1);
+                        cryptonightlite_hash(in, (char*)hash, size, 1);
                         break;
                  case CNTurtle:
-                        cryptonightturtle_hash(in, hash, size, 1);
+                        cryptonightturtle_hash(in, (char*)hash, size, 1);
                         break;
                  case CNTurtlelite:
-                        cryptonightturtlelite_hash(in, hash, size, 1);
+                        cryptonightturtlelite_hash(in, (char*)hash, size, 1);
                         break;
                 }
                 //selection core algo
