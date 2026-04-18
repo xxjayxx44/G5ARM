@@ -135,8 +135,8 @@ void gr_hash(const char* input, char* output, uint32_t len) {
         int size = 80;
         uint8_t selectedAlgoOutput[15] = {0};
         uint8_t selectedCNAlgoOutput[6] = {0};
-        getAlgoString(&input[4], 64, selectedAlgoOutput, 15);
-        getAlgoString(&input[4], 64, selectedCNAlgoOutput, 6);
+        getAlgoString((void *)&input[4], 64, selectedAlgoOutput, 15);
+        getAlgoString((void *)&input[4], 64, selectedCNAlgoOutput, 6);
         int i;
         for (i = 0; i < 18; i++)
         {
@@ -177,22 +177,22 @@ void gr_hash(const char* input, char* output, uint32_t len) {
                 switch(cnAlgo)
                 {
                  case CNDark:
-                        cryptonightdark_hash(in, hash, size, 1);
+                        cryptonightdark_hash(in, (char *)hash, size, 1);
                         break;
                  case CNDarklite:
-                        cryptonightdarklite_hash(in, hash, size, 1);
+                        cryptonightdarklite_hash(in, (char *)hash, size, 1);
                         break;
                  case CNFast:
-                        cryptonightfast_hash(in, hash, size, 1);
+                        cryptonightfast_hash(in, (char *)hash, size, 1);
                         break;
                  case CNLite:
-                        cryptonightlite_hash(in, hash, size, 1);
+                        cryptonightlite_hash(in, (char *)hash, size, 1);
                         break;
                  case CNTurtle:
-                        cryptonightturtle_hash(in, hash, size, 1);
+                        cryptonightturtle_hash(in, (char *)hash, size, 1);
                         break;
                  case CNTurtlelite:
-                        cryptonightturtlelite_hash(in, hash, size, 1);
+                        cryptonightturtlelite_hash(in, (char *)hash, size, 1);
                         break;
                 }
                 //selection core algo
