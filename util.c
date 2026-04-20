@@ -49,33 +49,9 @@ extern pthread_mutex_t stats_lock;
 /* =========================================================================
  * work_set_target_ratio
  *
- * Called by scanhash_minotaur (and other scanhash implementations) after a
- * candidate share is found.  Computes how close the found hash is to the
- * work target and stores it in work->shareratio / work->sharediff so the
- * main loop can display accurate share-difficulty information.
- *
- * The ratio is defined as:
- *   ratio = target_difficulty / hash_difficulty
- *         = (0xFFFF0000UL << 192) / hash_value   (simplified)
- *
- * We approximate it by comparing the big-endian 256-bit hash against the
- * big-endian 256-bit target word-by-word from the most-significant end.
+ * This function is now defined in uint256.cpp to avoid duplicate definition.
+ * The implementation in C++ uses uint256 for more precise difficulty calculations.
  * ========================================================================= */
-void work_set_target_ratio(struct work *work, const uint32_t *hash)
-{
-    /* target_to_diff is already defined further down in this file; forward
-     * use is fine because this function is only called at runtime. */
-    double hash_diff  = target_to_diff((uint32_t *)hash);
-    double work_diff  = work->targetdiff;
-
-    if (hash_diff > 0.0) {
-        work->shareratio = work_diff / hash_diff;
-        work->sharediff  = hash_diff;
-    } else {
-        work->shareratio = 0.0;
-        work->sharediff  = 0.0;
-    }
-}
 
 /* =========================================================================
  * Standard data / upload / header buffer helpers
