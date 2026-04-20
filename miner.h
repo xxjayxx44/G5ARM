@@ -424,8 +424,8 @@ bool fulltest(const uint32_t *hash, const uint32_t *target);
 void work_set_target(struct work* work, double diff);
 double target_to_diff(uint32_t* target);
 
-double hash_target_ratio(uint32_t* hash, uint32_t* target);
-void work_set_target_ratio(struct work* work, const uint32_t* hash);   // <-- FIXED: added const
+double hash_target_ratio(const uint32_t* hash, uint32_t* target);   // <-- FIXED: added const
+void work_set_target_ratio(struct work* work, const uint32_t* hash); // <-- already const
 
 void get_currentalgo(char* buf, int sz);
 bool has_aes_ni(void);
@@ -607,6 +607,5 @@ void yescrypt_hash_r8(const char* input, char* output, uint32_t len);
 void yescrypt_hash_r16(const char* input, char* output, uint32_t len);
 void yescrypt_hash_r32(const char* input, char* output, uint32_t len);
 void zr5hash_pok(void *output, uint32_t *pdata);
-
 
 #endif /* __MINER_H__ */
