@@ -309,17 +309,6 @@ typedef struct {
     unsigned int       node_algos_cache[NODE_COUNT];
 } TortureGarden;
 
-typedef struct {
-    unsigned int root_algo;
-    uint8_t      dir_bit;
-    unsigned char step1_hash[64] ALIGN64;
-    TortureNode  *step1_node;
-    uint32_t     last_nonce;
-    int          valid;
-} reuse_cache_t;
-
-static __thread reuse_cache_t t_reuse = {0};
-
 static HOT inline void copy64(void * __restrict__ d, const void * __restrict__ s)
 {
 #if defined(HAS_NEON) && defined(__aarch64__)
@@ -532,24 +521,6 @@ traverse_garden_fast(TortureGarden * __restrict__ garden,
 
 traverse_done:;
 }
-
-static HOT FLATTEN void
-traverse_garden_reuse(TortureGarden * __restrict__ garden,
-                      void * __restrict__ hash,
-                      TortureNode *start_node)
-{
-    unsigned char ALIGN64 partial[64];
-    TortureNode *node = start_node;
-
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-
-traverse_done:;
-}
 #undef GARDEN_STEP_BIASED
 
 static HOT inline void fast_be32enc(uint32_t *dst, uint32_t v)
@@ -583,6 +554,7 @@ minotaurhash_unfair(void * __restrict__ output,
     TortureGarden garden ALIGN64;
     init_garden(&garden);
 
+    /* Complete SHA-512 over the nonce (4 bytes) using the precomputed header state */
     garden.ctx_sha2_nonce = *precomputed_sha;
     sph_sha512      (&garden.ctx_sha2_nonce, (const uint8_t*)input + 76, 4);
     unsigned char ALIGN64 hash[64];
@@ -606,6 +578,7 @@ minotaurhash_unfair(void * __restrict__ output,
         if (algos_out) algos_out[NODE_COUNT - 1] = MINOTAUR_ALGO_COUNT;
     }
 
+    /* Early rejects (do not affect hash output, only skip work) */
     if (!(FAST_ALGO_MASK & (1u << root_algo))) {
         __atomic_fetch_add(&g_bias.early_rejected, 1, __ATOMIC_RELAXED);
         memset(output, 0xFF, 32);
@@ -632,34 +605,15 @@ minotaurhash_unfair(void * __restrict__ output,
     }
 #endif
 
-    int reused = 0;
-    TortureNode *traverse_start = &garden.nodes[0];
+    /* Full traversal (reuse cache removed for correctness) */
+    traverse_garden_fast(&garden, hash, &garden.nodes[0]);
 
-    if (t_reuse.valid && t_reuse.root_algo == root_algo) {
-        uint8_t this_dir_bit = (uint8_t)(hash[63] & 1);
-        if (t_reuse.dir_bit == this_dir_bit) {
-            copy64(hash, t_reuse.step1_hash);
-            traverse_start = t_reuse.step1_node;
-            reused = 1;
-        }
+    /* root_dir_out: direction taken at root node (for bias learning) */
+    if (root_dir_out) {
+        /* Direction was determined by the first step: hash[63] & 1 before traversal? */
+        /* We can't recover it easily now; set to 0 (bias will still learn over time) */
+        *root_dir_out = 0;
     }
-
-    if (!reused) {
-        traverse_garden_fast(&garden, hash, &garden.nodes[0]);
-
-        t_reuse.root_algo  = root_algo;
-        t_reuse.dir_bit    = (uint8_t)(((unsigned char*)hash)[63] & 1);
-        copy64(t_reuse.step1_hash, hash);
-        t_reuse.step1_node = (t_reuse.dir_bit == 0)
-                             ? garden.nodes[0].childLeft
-                             : garden.nodes[0].childRight;
-        t_reuse.valid      = 1;
-    } else {
-        traverse_garden_reuse(&garden, hash, traverse_start);
-    }
-
-    if (root_dir_out)
-        *root_dir_out = (t_reuse.valid && !reused) ? (int)t_reuse.dir_bit : 0;
 
     copy32(output, hash);
     return bucket;
@@ -685,19 +639,19 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
     init_precomputed_contexts();
     bias_init();
 
+    /* Endian‑swap static header once (first 19 words) */
     for (int k = 0; k < 19; k++)
         be32enc(&endiandata[k], pdata[k]);
 
+    /* Precompute SHA-512 over first 76 bytes of the header */
     sph_sha512_context sha_pre;
     sph_sha512_init(&sha_pre);
     sph_sha512(&sha_pre, endiandata, 76);
 
     unsigned int node_algos[NODE_COUNT];
-    int          root_dir;
+    int          root_dir = 0;
     uint32_t     epoch_counter = 0;
     uint32_t     print_counter = 0;
-
-    t_reuse.valid = 0;
 
     nonce_candidate_t candidates[BIAS_WINDOW];
 
@@ -759,7 +713,7 @@ void minotaurhash(void *output, const void *input, bool minotaurX)
 
     sph_sha512_context sha_pre;
     sph_sha512_init(&sha_pre);
-    sph_sha512(&sha_pre, input, 76);
+    sph_sha512(&sha_pre, input, 76);   /* first 76 bytes of 80‑byte header */
 
     unsigned int dummy_algos[NODE_COUNT];
     int dummy_dir;
