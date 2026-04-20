@@ -425,7 +425,7 @@ void work_set_target(struct work* work, double diff);
 double target_to_diff(uint32_t* target);
 
 double hash_target_ratio(uint32_t* hash, uint32_t* target);
-void work_set_target_ratio(struct work* work, uint32_t* hash);
+void work_set_target_ratio(struct work* work, const uint32_t* hash);   // <-- FIXED: added const
 
 void get_currentalgo(char* buf, int sz);
 bool has_aes_ni(void);
