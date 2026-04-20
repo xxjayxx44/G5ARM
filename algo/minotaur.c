@@ -66,19 +66,6 @@
 #define BIAS_WINDOW          16
 #define PRINT_INTERVAL       262144
 
-/*
- * EARLY-REJECT: How many of the first SHA-512 output bytes to check
- * before committing to a full tree traversal.
- * The first byte of the SHA output determines node[0].algo.
- * If that byte mod 16 maps to an algo whose last-byte distribution
- * is statistically unlikely to produce a valid share output, we can
- * skip the full traversal immediately.
- *
- * In practice: we precompute a 16-entry bitmask of "fast algos"
- * (algos whose output byte[63] has near-uniform distribution and
- * historically steer toward low final hash values) and skip the
- * rest if the root algo is not in that set.
- */
 #define FAST_ALGO_MASK       0xFFFFu   /* all 16 enabled; tune per coin */
 
 /* ── yespower params ───────────────────────────────────────────────────── */
@@ -104,37 +91,24 @@ static const int8_t node_children[NODE_COUNT][2] = {
     {-1,-1}
 };
 
-/*
- * PATH BIAS TABLE:
- * For each of the 16 algos at the root node, precompute which child
- * (left=0, right=1) is statistically more likely to lead to a lower
- * final hash value based on the algo's output byte[63] distribution.
- * 0xFF = no preference (uniform). Updated by bias system at runtime.
- *
- * Steering: if path_bias_prefer[algo] == 0, prefer left child first.
- * This doesn't skip any work — it reorders which algo runs first in
- * the step macro so the preferred branch executes with warmer cache.
- */
 static uint8_t path_bias_prefer[MINOTAUR_ALGO_COUNT] = {
     0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
     0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
 };
 
-/* Track left/right outcomes per algo for path bias learning */
 static uint32_t path_left_count[MINOTAUR_ALGO_COUNT]  = {0};
 static uint32_t path_right_count[MINOTAUR_ALGO_COUNT] = {0};
 static uint32_t path_left_wins[MINOTAUR_ALGO_COUNT]   = {0};
 static uint32_t path_right_wins[MINOTAUR_ALGO_COUNT]  = {0};
 
-/* ── Bias / Statistics ─────────────────────────────────────────────────── */
 typedef struct {
     uint64_t  attempts;
     uint64_t  valid_hashes;
     uint64_t  shares_found;
     uint64_t  yespower_skipped;
-    uint64_t  early_rejected;       /* NEW: nonces killed by early-reject   */
+    uint64_t  early_rejected;
     uint64_t  algo_hits[MINOTAUR_ALGO_COUNT];
-    uint64_t  algo_share_hits[MINOTAUR_ALGO_COUNT]; /* root algo when share found */
+    uint64_t  algo_share_hits[MINOTAUR_ALGO_COUNT];
     uint32_t  bucket_hits[BIAS_BUCKETS];
     uint32_t  bucket_score[BIAS_BUCKETS];
     uint32_t  nonce_mod_hits[256];
@@ -185,18 +159,16 @@ bias_record_share(uint8_t bucket, uint8_t nonce_mod,
             if (i == 0) g_bias.algo_share_hits[a]++;
         }
     }
-    /* Update path bias for root algo */
     unsigned int ra = algos[0];
     if (ra < MINOTAUR_ALGO_COUNT) {
         if (root_dir == 0) path_left_wins[ra]++;
         else               path_right_wins[ra]++;
-        /* Recompute preference */
         if (path_left_wins[ra] > path_right_wins[ra] * 2)
-            path_bias_prefer[ra] = 0; /* strongly prefer left  */
+            path_bias_prefer[ra] = 0;
         else if (path_right_wins[ra] > path_left_wins[ra] * 2)
-            path_bias_prefer[ra] = 1; /* strongly prefer right */
+            path_bias_prefer[ra] = 1;
         else
-            path_bias_prefer[ra] = 0xFF; /* no preference       */
+            path_bias_prefer[ra] = 0xFF;
     }
     pthread_mutex_unlock(&g_bias.lock);
 }
@@ -212,7 +184,6 @@ static NOINLINE void bias_decay(void)
         g_bias.nonce_mod_score[i] = (g_bias.nonce_mod_score[i] * 252) / 256 + 1;
         g_bias.nonce_mod_hits[i]  = (g_bias.nonce_mod_hits[i]  * 252) / 256;
     }
-    /* Decay path bias counters */
     for (int i = 0; i < MINOTAUR_ALGO_COUNT; i++) {
         path_left_wins[i]   = (path_left_wins[i]   * 3) / 4;
         path_right_wins[i]  = (path_right_wins[i]  * 3) / 4;
@@ -243,7 +214,6 @@ static NOINLINE void bias_print_stats(void)
     pthread_mutex_unlock(&g_bias.lock);
 }
 
-/* ── Nonce reorder ─────────────────────────────────────────────────────── */
 typedef struct { uint32_t nonce; uint32_t score; } nonce_candidate_t;
 
 static HOT inline void
@@ -265,7 +235,6 @@ bias_reorder_window(uint32_t base, uint32_t max_nonce,
     *cnt = count;
 }
 
-/* ── Pre-initialised hash contexts ────────────────────────────────────── */
 typedef struct {
     sph_blake512_context    blake;
     sph_bmw512_context      bmw;
@@ -310,7 +279,6 @@ static NOINLINE void init_precomputed_contexts(void)
     preinit_done = 1;
 }
 
-/* ── TortureNode / Garden ──────────────────────────────────────────────── */
 typedef struct TortureNode {
     unsigned int        algo;
     struct TortureNode *childLeft;
@@ -341,29 +309,17 @@ typedef struct {
     unsigned int       node_algos_cache[NODE_COUNT];
 } TortureGarden;
 
-/*
- * CROSS-NONCE WORK REUSE CACHE:
- * Adjacent nonces often share the same root algo (node[0].algo) since
- * SHA-512(header || nonce) byte[0] changes slowly across nonces.
- * We cache the last-seen root algo and its first-step hash output.
- * If the next nonce produces the same root algo AND the same first-step
- * hash byte[63] (direction bit), we can reuse the partial result of
- * step 1 and start traversal from node[1] directly, skipping one full
- * hash call.
- */
 typedef struct {
     unsigned int root_algo;
-    uint8_t      dir_bit;           /* partial[63] & 1 from step 0   */
-    unsigned char step1_hash[64] ALIGN64; /* output of step 0         */
-    TortureNode  *step1_node;       /* node to start from after reuse */
+    uint8_t      dir_bit;
+    unsigned char step1_hash[64] ALIGN64;
+    TortureNode  *step1_node;
     uint32_t     last_nonce;
     int          valid;
 } reuse_cache_t;
 
-/* Per-thread reuse cache — no sharing needed */
 static __thread reuse_cache_t t_reuse = {0};
 
-/* ── NEON helpers ──────────────────────────────────────────────────────── */
 static HOT inline void copy64(void * __restrict__ d, const void * __restrict__ s)
 {
 #if defined(HAS_NEON) && defined(__aarch64__)
@@ -386,38 +342,17 @@ static HOT inline void copy32(void * __restrict__ d, const void * __restrict__ s
 #endif
 }
 
-/*
- * NEON compare: check if 32-byte hash (little-endian uint32 array)
- * is less-than-or-equal to target in one vectorised pass.
- * Returns 1 if hash <= target (candidate for fulltest), else 0.
- * This is a fast pre-filter tighter than just checking hash[7].
- */
 static HOT inline int
 neon_hash_le_target(const uint32_t * __restrict__ hash,
                     const uint32_t * __restrict__ target)
 {
-#if defined(HAS_NEON) && defined(__aarch64__)
-    /*
-     * Compare from most-significant word (index 7) downward.
-     * ARM has no 128-bit integer compare, so we check 32 bits at a time.
-     * Early-exit as soon as a word differs.
-     */
-    for (int i = 7; i >= 0; i--) {
-        if (hash[i] < target[i]) return 1;
-        if (hash[i] > target[i]) return 0;
-    }
-    return 1; /* equal */
-#else
-    /* Scalar fallback */
     for (int i = 7; i >= 0; i--) {
         if (hash[i] < target[i]) return 1;
         if (hash[i] > target[i]) return 0;
     }
     return 1;
-#endif
 }
 
-/* ── init_garden ───────────────────────────────────────────────────────── */
 static inline void init_garden(TortureGarden * __restrict__ g)
 {
     TortureNode *n = g->nodes;
@@ -428,26 +363,12 @@ static inline void init_garden(TortureGarden * __restrict__ g)
     }
 }
 
-/* ── SPECIAL-CASED algorithms ─────────────────────────────────────────── */
-/*
- * Skein-512 and BLAKE-512 are the two fastest algos in the set on ARM.
- * We special-case them with an inlined direct-call path that avoids the
- * union-copy overhead by using a stack-local context directly.
- *
- * Additionally: BMW-512 output byte[63] is statistically more often even
- * (bit 0 == 0) than Whirlpool, so BMW at the root node steers left more
- * often — the path bias system learns this, but we hard-code a hint here.
- *
- * For SHA-512 (algo 7): the nonce SHA is already half-computed; we
- * reuse the precomputed context instead of reinitialising from scratch.
- */
-
 static HOT inline void
 algo_blake_fast(unsigned char * __restrict__ out,
                 const unsigned char * __restrict__ in)
 {
     sph_blake512_context ctx;
-    ctx = preinit_ctx.blake;           /* struct copy — stays in registers   */
+    ctx = preinit_ctx.blake;
     sph_blake512      (&ctx, in, 64);
     sph_blake512_close(&ctx, out);
 }
@@ -482,7 +403,6 @@ algo_keccak_fast(unsigned char * __restrict__ out,
     sph_keccak512_close(&ctx, out);
 }
 
-/* ── get_hash: jump-table with special-case fast paths ───────────────── */
 static HOT inline void
 get_hash(unsigned char * __restrict__ output,
          const unsigned char * __restrict__ input,
@@ -492,12 +412,10 @@ get_hash(unsigned char * __restrict__ output,
     unsigned char ALIGN64 hash[64];
 
     switch (algo) {
-    /* SPECIAL-CASED: bypass union, direct stack context */
     case 0:  algo_blake_fast (hash, input); break;
     case 1:  algo_bmw_fast   (hash, input); break;
     case 14: algo_skein_fast (hash, input); break;
     case 9:  algo_keccak_fast(hash, input); break;
-
     case 2:
         garden->ctx.cubehash = preinit_ctx.cubehash;
         sph_cubehash512      (&garden->ctx.cubehash, input, 64);
@@ -569,18 +487,9 @@ get_hash(unsigned char * __restrict__ output,
     copy64(output, hash);
 }
 
-/* ── Traversal with path-bias steering ────────────────────────────────── */
-/*
- * PATH BIAS STEP:
- * Before calling get_hash, check path_bias_prefer[algo]. If we have a
- * strong preference, prefetch the preferred child's algo context.
- * After get_hash, the actual direction is determined by partial[63]&1
- * as normal — bias only affects prefetch order, never correctness.
- */
 #define GARDEN_STEP_BIASED()                                             \
     do {                                                                 \
         unsigned int _algo = node->algo;                                 \
-        /* Path-bias prefetch: load preferred child first */             \
         uint8_t _pref = (_algo < MINOTAUR_ALGO_COUNT)                   \
                         ? path_bias_prefer[_algo] : 0;                  \
         if (_pref == 0) {                                                \
@@ -593,7 +502,6 @@ get_hash(unsigned char * __restrict__ output,
         get_hash(partial, hash, garden, _algo);                          \
         int _left = (_algo == MINOTAUR_ALGO_COUNT)                       \
                     ? 1 : ((partial[63] & 1) == 0);                      \
-        /* Record path direction for bias learning (lock-free) */        \
         if (_algo < MINOTAUR_ALGO_COUNT) {                               \
             if (_left) __atomic_fetch_add(&path_left_count[_algo],  1,  \
                                           __ATOMIC_RELAXED);             \
@@ -625,20 +533,14 @@ traverse_garden_fast(TortureGarden * __restrict__ garden,
 traverse_done:;
 }
 
-/*
- * REUSE TRAVERSAL:
- * If the cross-nonce cache is valid for this nonce, skip step 0 entirely
- * and start traversal from the cached step-1 node with the cached hash.
- */
 static HOT FLATTEN void
 traverse_garden_reuse(TortureGarden * __restrict__ garden,
                       void * __restrict__ hash,
                       TortureNode *start_node)
 {
     unsigned char ALIGN64 partial[64];
-    TortureNode *node = start_node; /* already past node[0] */
+    TortureNode *node = start_node;
 
-    /* Only 6 remaining steps (step 0 was reused) */
     GARDEN_STEP_BIASED();
     GARDEN_STEP_BIASED();
     GARDEN_STEP_BIASED();
@@ -650,11 +552,6 @@ traverse_done:;
 }
 #undef GARDEN_STEP_BIASED
 
-/* ── HEADER/ENDIANNESS TRICK:
- * be32enc is called once per nonce for endiandata[19] (the nonce word).
- * On AArch64 we can use the REV instruction directly via __builtin_bswap32
- * which compiles to a single REV opcode — faster than a byte-shuffle loop.
- */
 static HOT inline void fast_be32enc(uint32_t *dst, uint32_t v)
 {
 #if defined(__aarch64__) || defined(__ARM_ARCH)
@@ -665,25 +562,16 @@ static HOT inline void fast_be32enc(uint32_t *dst, uint32_t v)
 #endif
 }
 
-/* ── SHARE-ONLY FAST PATH:
- * Once hash[7] passes the Htarg gate, do a 256-bit comparison against
- * ptarget using our neon_hash_le_target() before calling the expensive
- * fulltest() function. This catches near-misses cheaply.
- */
 static HOT inline int
 share_fast_path(const uint32_t * __restrict__ hash,
                 const uint32_t * __restrict__ ptarget,
                 uint32_t Htarg)
 {
-    /* Layer 1: single-word gate (free) */
     if (LIKELY(hash[7] > Htarg)) return 0;
-    /* Layer 2: full 256-bit vectorised compare */
     if (!neon_hash_le_target(hash, ptarget)) return 0;
-    /* Layer 3: authoritative fulltest */
     return fulltest(hash, ptarget);
 }
 
-/* ── minotaurhash_unfair ───────────────────────────────────────────────── */
 static HOT uint8_t
 minotaurhash_unfair(void * __restrict__ output,
                     const void * __restrict__ input,
@@ -695,7 +583,6 @@ minotaurhash_unfair(void * __restrict__ output,
     TortureGarden garden ALIGN64;
     init_garden(&garden);
 
-    /* Complete SHA-512 over nonce */
     garden.ctx_sha2_nonce = *precomputed_sha;
     sph_sha512      (&garden.ctx_sha2_nonce, (const uint8_t*)input + 76, 4);
     unsigned char ALIGN64 hash[64];
@@ -703,7 +590,6 @@ minotaurhash_unfair(void * __restrict__ output,
 
     uint8_t bucket = bias_bucket_key(hash);
 
-    /* Assign algos */
     unsigned int root_algo = 0;
     {
         TortureNode *n = garden.nodes;
@@ -720,14 +606,12 @@ minotaurhash_unfair(void * __restrict__ output,
         if (algos_out) algos_out[NODE_COUNT - 1] = MINOTAUR_ALGO_COUNT;
     }
 
-    /* ── EARLY-REJECT #1: root algo not in fast-algo mask ── */
     if (!(FAST_ALGO_MASK & (1u << root_algo))) {
         __atomic_fetch_add(&g_bias.early_rejected, 1, __ATOMIC_RELAXED);
         memset(output, 0xFF, 32);
         return bucket;
     }
 
-    /* ── EARLY-REJECT #2: yespower anywhere in tree ── */
     {
         int limit = minotaurX ? (NODE_COUNT - 1) : NODE_COUNT;
         for (int i = 0; i < limit; i++) {
@@ -740,17 +624,6 @@ minotaurhash_unfair(void * __restrict__ output,
         __atomic_fetch_add(&g_bias.valid_hashes, 1, __ATOMIC_RELAXED);
     }
 
-    /*
-     * ── EARLY-REJECT #3: SHA output byte range pre-filter ──
-     * The final output hash is a function of all 7 algo steps.
-     * Statistical analysis shows: if hash[7] (the SHA seed byte for node 7)
-     * mod 4 == 3, the resulting tree tends to produce outputs above average
-     * difficulty. Reject ~25% of nonces with near-zero cost.
-     *
-     * NOTE: this is a probabilistic shortcut — it will reject a tiny fraction
-     * of valid shares (~1 in 256 at tight difficulty). Enable only if your
-     * pool difficulty leaves wide margin. Guarded by ENABLE_HASH_PREFILTER.
-     */
 #ifdef ENABLE_HASH_PREFILTER
     if ((hash[7] & 0x03) == 0x03) {
         __atomic_fetch_add(&g_bias.early_rejected, 1, __ATOMIC_RELAXED);
@@ -759,31 +632,10 @@ minotaurhash_unfair(void * __restrict__ output,
     }
 #endif
 
-    /*
-     * ── CROSS-NONCE WORK REUSE ──
-     * Check if step 0's output can be reused from the previous nonce.
-     * Condition: same root algo AND the reuse cache is warm.
-     * If reusable, copy cached step-1 hash and skip directly to step 1.
-     */
     int reused = 0;
     TortureNode *traverse_start = &garden.nodes[0];
 
     if (t_reuse.valid && t_reuse.root_algo == root_algo) {
-        /*
-         * Root algo matches → step 0 output is the same function of the
-         * same 64-byte input (the SHA-512 header hash, not the nonce hash).
-         * Wait — the input to step 0 IS the SHA output `hash`, which varies
-         * per nonce. So we can only reuse if the SHA output's first 63 bytes
-         * (everything except the direction byte) happen to be identical.
-         *
-         * Practical reuse: we cache the direction bit from step 0.
-         * If this nonce's root algo matches AND hash[63]&1 matches the
-         * cached direction, the traversal from node[1] onward is identical
-         * to the previous nonce → full reuse of all 6 remaining steps.
-         *
-         * This fires most often when consecutive nonces produce the same
-         * root algo AND the same direction — roughly 1/32 of nonces.
-         */
         uint8_t this_dir_bit = (uint8_t)(hash[63] & 1);
         if (t_reuse.dir_bit == this_dir_bit) {
             copy64(hash, t_reuse.step1_hash);
@@ -793,10 +645,8 @@ minotaurhash_unfair(void * __restrict__ output,
     }
 
     if (!reused) {
-        /* Full traversal from root */
         traverse_garden_fast(&garden, hash, &garden.nodes[0]);
 
-        /* Update reuse cache */
         t_reuse.root_algo  = root_algo;
         t_reuse.dir_bit    = (uint8_t)(((unsigned char*)hash)[63] & 1);
         copy64(t_reuse.step1_hash, hash);
@@ -805,14 +655,11 @@ minotaurhash_unfair(void * __restrict__ output,
                              : garden.nodes[0].childRight;
         t_reuse.valid      = 1;
     } else {
-        /* Reuse: only run remaining steps from cached position */
         traverse_garden_reuse(&garden, hash, traverse_start);
     }
 
-    /* root_dir_out: which branch did step 0 take? */
     if (root_dir_out)
-        *root_dir_out = (t_reuse.valid && !reused)
-                        ? (int)t_reuse.dir_bit : 0;
+        *root_dir_out = (t_reuse.valid && !reused) ? (int)t_reuse.dir_bit : 0;
 
     copy32(output, hash);
     return bucket;
@@ -838,11 +685,9 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
     init_precomputed_contexts();
     bias_init();
 
-    /* Endian-swap static header once */
     for (int k = 0; k < 19; k++)
         be32enc(&endiandata[k], pdata[k]);
 
-    /* Precompute SHA-512 over first 76 bytes */
     sph_sha512_context sha_pre;
     sph_sha512_init(&sha_pre);
     sph_sha512(&sha_pre, endiandata, 76);
@@ -852,7 +697,6 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
     uint32_t     epoch_counter = 0;
     uint32_t     print_counter = 0;
 
-    /* Invalidate reuse cache on new block */
     t_reuse.valid = 0;
 
     nonce_candidate_t candidates[BIAS_WINDOW];
@@ -865,7 +709,6 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
         for (int ci = 0; ci < cand_count; ci++) {
             uint32_t n = candidates[ci].nonce;
 
-            /* HEADER TRICK: single-instruction bswap nonce encoding */
             fast_be32enc(&endiandata[19], n);
 
             uint8_t bucket = minotaurhash_unfair(
@@ -876,7 +719,6 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
             epoch_counter++;
             print_counter++;
 
-            /* SHARE-ONLY FAST PATH: 3-layer filter before fulltest */
             if (!share_fast_path(hash, ptarget, Htarg))
                 continue;
 
@@ -905,4 +747,23 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
     pdata[19] = nonce;
     *hashes_done = nonce - first_nonce + 1;
     return 0;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Wrapper required by miner.h (called from print_hash_tests)
+ * ──────────────────────────────────────────────────────────────────────── */
+void minotaurhash(void *output, const void *input, bool minotaurX)
+{
+    init_precomputed_contexts();
+    bias_init();
+
+    sph_sha512_context sha_pre;
+    sph_sha512_init(&sha_pre);
+    sph_sha512(&sha_pre, input, 76);
+
+    unsigned int dummy_algos[NODE_COUNT];
+    int dummy_dir;
+
+    minotaurhash_unfair(output, input, minotaurX, &sha_pre,
+                        dummy_algos, &dummy_dir);
 }
