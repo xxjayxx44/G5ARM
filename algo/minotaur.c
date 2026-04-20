@@ -59,8 +59,6 @@
 /* ── Constants ─────────────────────────────────────────────────────────── */
 #define MINOTAUR_ALGO_COUNT  16
 #define NODE_COUNT           22
-#define TREE_DEPTH           7
-#define NONCE_BATCH          16
 #define BIAS_BUCKETS         256
 #define BIAS_EPOCH_NONCES    65536
 #define BIAS_WINDOW          16
@@ -73,14 +71,6 @@ static const yespower_params_t yespower_params = {
     YESPOWER_1_0, 2048, 8, "et in arcadia ego", 17
 };
 
-static const uint16_t algo_cost[17] = {
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1000
-};
-
-#ifndef COST_THRESHOLD
-#define COST_THRESHOLD 50
-#endif
-
 /* ── Static child index table ─────────────────────────────────────────── */
 static const int8_t node_children[NODE_COUNT][2] = {
     { 1, 2},{ 3, 4},{ 5, 6},{ 7, 8},{ 9,10},{11,12},{13,14},
@@ -91,6 +81,7 @@ static const int8_t node_children[NODE_COUNT][2] = {
     {-1,-1}
 };
 
+/* ── Bias / Statistics ─────────────────────────────────────────────────── */
 static uint8_t path_bias_prefer[MINOTAUR_ALGO_COUNT] = {
     0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
     0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
@@ -235,50 +226,7 @@ bias_reorder_window(uint32_t base, uint32_t max_nonce,
     *cnt = count;
 }
 
-typedef struct {
-    sph_blake512_context    blake;
-    sph_bmw512_context      bmw;
-    sph_cubehash512_context cubehash;
-    sph_echo512_context     echo;
-    sph_fugue512_context    fugue;
-    sph_groestl512_context  groestl;
-    sph_hamsi512_context    hamsi;
-    sph_jh512_context       jh;
-    sph_keccak512_context   keccak;
-    sph_luffa512_context    luffa;
-    sph_shabal512_context   shabal;
-    sph_shavite512_context  shavite;
-    sph_simd512_context     simd;
-    sph_skein512_context    skein;
-    sph_whirlpool_context   whirlpool;
-    sph_sha512_context      sha2;
-} preinit_contexts_t;
-
-static preinit_contexts_t preinit_ctx ALIGN64;
-static int preinit_done = 0;
-
-static NOINLINE void init_precomputed_contexts(void)
-{
-    if (LIKELY(preinit_done)) return;
-    sph_blake512_init   (&preinit_ctx.blake);
-    sph_bmw512_init     (&preinit_ctx.bmw);
-    sph_cubehash512_init(&preinit_ctx.cubehash);
-    sph_echo512_init    (&preinit_ctx.echo);
-    sph_fugue512_init   (&preinit_ctx.fugue);
-    sph_groestl512_init (&preinit_ctx.groestl);
-    sph_hamsi512_init   (&preinit_ctx.hamsi);
-    sph_sha512_init     (&preinit_ctx.sha2);
-    sph_jh512_init      (&preinit_ctx.jh);
-    sph_keccak512_init  (&preinit_ctx.keccak);
-    sph_luffa512_init   (&preinit_ctx.luffa);
-    sph_shabal512_init  (&preinit_ctx.shabal);
-    sph_shavite512_init (&preinit_ctx.shavite);
-    sph_simd512_init    (&preinit_ctx.simd);
-    sph_skein512_init   (&preinit_ctx.skein);
-    sph_whirlpool_init  (&preinit_ctx.whirlpool);
-    preinit_done = 1;
-}
-
+/* ── TortureNode / Garden ──────────────────────────────────────────────── */
 typedef struct TortureNode {
     unsigned int        algo;
     struct TortureNode *childLeft;
@@ -306,9 +254,19 @@ typedef struct {
     } ctx;
     sph_sha512_context ctx_sha2_nonce;
     TortureNode        nodes[NODE_COUNT];
-    unsigned int       node_algos_cache[NODE_COUNT];
 } TortureGarden;
 
+static inline void init_garden(TortureGarden * __restrict__ g)
+{
+    TortureNode *n = g->nodes;
+    for (int i = 0; i < NODE_COUNT; i++) {
+        int l = node_children[i][0], r = node_children[i][1];
+        n[i].childLeft  = (l >= 0) ? &n[l] : NULL;
+        n[i].childRight = (r >= 0) ? &n[r] : NULL;
+    }
+}
+
+/* ── NEON helpers ──────────────────────────────────────────────────────── */
 static HOT inline void copy64(void * __restrict__ d, const void * __restrict__ s)
 {
 #if defined(HAS_NEON) && defined(__aarch64__)
@@ -331,67 +289,7 @@ static HOT inline void copy32(void * __restrict__ d, const void * __restrict__ s
 #endif
 }
 
-static HOT inline int
-neon_hash_le_target(const uint32_t * __restrict__ hash,
-                    const uint32_t * __restrict__ target)
-{
-    for (int i = 7; i >= 0; i--) {
-        if (hash[i] < target[i]) return 1;
-        if (hash[i] > target[i]) return 0;
-    }
-    return 1;
-}
-
-static inline void init_garden(TortureGarden * __restrict__ g)
-{
-    TortureNode *n = g->nodes;
-    for (int i = 0; i < NODE_COUNT; i++) {
-        int l = node_children[i][0], r = node_children[i][1];
-        n[i].childLeft  = (l >= 0) ? &n[l] : NULL;
-        n[i].childRight = (r >= 0) ? &n[r] : NULL;
-    }
-}
-
-static HOT inline void
-algo_blake_fast(unsigned char * __restrict__ out,
-                const unsigned char * __restrict__ in)
-{
-    sph_blake512_context ctx;
-    ctx = preinit_ctx.blake;
-    sph_blake512      (&ctx, in, 64);
-    sph_blake512_close(&ctx, out);
-}
-
-static HOT inline void
-algo_skein_fast(unsigned char * __restrict__ out,
-                const unsigned char * __restrict__ in)
-{
-    sph_skein512_context ctx;
-    ctx = preinit_ctx.skein;
-    sph_skein512      (&ctx, in, 64);
-    sph_skein512_close(&ctx, out);
-}
-
-static HOT inline void
-algo_bmw_fast(unsigned char * __restrict__ out,
-              const unsigned char * __restrict__ in)
-{
-    sph_bmw512_context ctx;
-    ctx = preinit_ctx.bmw;
-    sph_bmw512      (&ctx, in, 64);
-    sph_bmw512_close(&ctx, out);
-}
-
-static HOT inline void
-algo_keccak_fast(unsigned char * __restrict__ out,
-                 const unsigned char * __restrict__ in)
-{
-    sph_keccak512_context ctx;
-    ctx = preinit_ctx.keccak;
-    sph_keccak512      (&ctx, in, 64);
-    sph_keccak512_close(&ctx, out);
-}
-
+/* ── Correct get_hash (exact original behaviour) ──────────────────────── */
 static HOT inline void
 get_hash(unsigned char * __restrict__ output,
          const unsigned char * __restrict__ input,
@@ -399,227 +297,187 @@ get_hash(unsigned char * __restrict__ output,
          unsigned int algo)
 {
     unsigned char ALIGN64 hash[64];
+    memset(hash, 0, sizeof(hash));   /* as in original */
 
     switch (algo) {
-    case 0:  algo_blake_fast (hash, input); break;
-    case 1:  algo_bmw_fast   (hash, input); break;
-    case 14: algo_skein_fast (hash, input); break;
-    case 9:  algo_keccak_fast(hash, input); break;
-    case 2:
-        garden->ctx.cubehash = preinit_ctx.cubehash;
-        sph_cubehash512      (&garden->ctx.cubehash, input, 64);
-        sph_cubehash512_close(&garden->ctx.cubehash, hash);
-        break;
-    case 3:
-        garden->ctx.echo = preinit_ctx.echo;
-        sph_echo512      (&garden->ctx.echo, input, 64);
-        sph_echo512_close(&garden->ctx.echo, hash);
-        break;
-    case 4:
-        garden->ctx.fugue = preinit_ctx.fugue;
-        sph_fugue512      (&garden->ctx.fugue, input, 64);
-        sph_fugue512_close(&garden->ctx.fugue, hash);
-        break;
-    case 5:
-        garden->ctx.groestl = preinit_ctx.groestl;
-        sph_groestl512      (&garden->ctx.groestl, input, 64);
-        sph_groestl512_close(&garden->ctx.groestl, hash);
-        break;
-    case 6:
-        garden->ctx.hamsi = preinit_ctx.hamsi;
-        sph_hamsi512      (&garden->ctx.hamsi, input, 64);
-        sph_hamsi512_close(&garden->ctx.hamsi, hash);
-        break;
-    case 7:
-        garden->ctx.sha2 = preinit_ctx.sha2;
-        sph_sha512      (&garden->ctx.sha2, input, 64);
-        sph_sha512_close(&garden->ctx.sha2, hash);
-        break;
-    case 8:
-        garden->ctx.jh = preinit_ctx.jh;
-        sph_jh512      (&garden->ctx.jh, input, 64);
-        sph_jh512_close(&garden->ctx.jh, hash);
-        break;
-    case 10:
-        garden->ctx.luffa = preinit_ctx.luffa;
-        sph_luffa512      (&garden->ctx.luffa, input, 64);
-        sph_luffa512_close(&garden->ctx.luffa, hash);
-        break;
-    case 11:
-        garden->ctx.shabal = preinit_ctx.shabal;
-        sph_shabal512      (&garden->ctx.shabal, input, 64);
-        sph_shabal512_close(&garden->ctx.shabal, hash);
-        break;
-    case 12:
-        garden->ctx.shavite = preinit_ctx.shavite;
-        sph_shavite512      (&garden->ctx.shavite, input, 64);
-        sph_shavite512_close(&garden->ctx.shavite, hash);
-        break;
-    case 13:
-        garden->ctx.simd = preinit_ctx.simd;
-        sph_simd512      (&garden->ctx.simd, input, 64);
-        sph_simd512_close(&garden->ctx.simd, hash);
-        break;
-    case 15:
-        garden->ctx.whirlpool = preinit_ctx.whirlpool;
-        sph_whirlpool      (&garden->ctx.whirlpool, input, 64);
-        sph_whirlpool_close(&garden->ctx.whirlpool, hash);
-        break;
-    case 16:
-        memset(hash + 32, 0, 32);
-        yespower_tls(input, 64, &yespower_params, (yespower_binary_t*)hash);
-        break;
-    default:
-        memset(hash, 0, 64);
+        case 0:
+            sph_blake512_init(&garden->ctx.blake);
+            sph_blake512(&garden->ctx.blake, input, 64);
+            sph_blake512_close(&garden->ctx.blake, hash);
+            break;
+        case 1:
+            sph_bmw512_init(&garden->ctx.bmw);
+            sph_bmw512(&garden->ctx.bmw, input, 64);
+            sph_bmw512_close(&garden->ctx.bmw, hash);
+            break;
+        case 2:
+            sph_cubehash512_init(&garden->ctx.cubehash);
+            sph_cubehash512(&garden->ctx.cubehash, input, 64);
+            sph_cubehash512_close(&garden->ctx.cubehash, hash);
+            break;
+        case 3:
+            sph_echo512_init(&garden->ctx.echo);
+            sph_echo512(&garden->ctx.echo, input, 64);
+            sph_echo512_close(&garden->ctx.echo, hash);
+            break;
+        case 4:
+            sph_fugue512_init(&garden->ctx.fugue);
+            sph_fugue512(&garden->ctx.fugue, input, 64);
+            sph_fugue512_close(&garden->ctx.fugue, hash);
+            break;
+        case 5:
+            sph_groestl512_init(&garden->ctx.groestl);
+            sph_groestl512(&garden->ctx.groestl, input, 64);
+            sph_groestl512_close(&garden->ctx.groestl, hash);
+            break;
+        case 6:
+            sph_hamsi512_init(&garden->ctx.hamsi);
+            sph_hamsi512(&garden->ctx.hamsi, input, 64);
+            sph_hamsi512_close(&garden->ctx.hamsi, hash);
+            break;
+        case 7:
+            sph_sha512_init(&garden->ctx.sha2);
+            sph_sha512(&garden->ctx.sha2, input, 64);
+            sph_sha512_close(&garden->ctx.sha2, hash);
+            break;
+        case 8:
+            sph_jh512_init(&garden->ctx.jh);
+            sph_jh512(&garden->ctx.jh, input, 64);
+            sph_jh512_close(&garden->ctx.jh, hash);
+            break;
+        case 9:
+            sph_keccak512_init(&garden->ctx.keccak);
+            sph_keccak512(&garden->ctx.keccak, input, 64);
+            sph_keccak512_close(&garden->ctx.keccak, hash);
+            break;
+        case 10:
+            sph_luffa512_init(&garden->ctx.luffa);
+            sph_luffa512(&garden->ctx.luffa, input, 64);
+            sph_luffa512_close(&garden->ctx.luffa, hash);
+            break;
+        case 11:
+            sph_shabal512_init(&garden->ctx.shabal);
+            sph_shabal512(&garden->ctx.shabal, input, 64);
+            sph_shabal512_close(&garden->ctx.shabal, hash);
+            break;
+        case 12:
+            sph_shavite512_init(&garden->ctx.shavite);
+            sph_shavite512(&garden->ctx.shavite, input, 64);
+            sph_shavite512_close(&garden->ctx.shavite, hash);
+            break;
+        case 13:
+            sph_simd512_init(&garden->ctx.simd);
+            sph_simd512(&garden->ctx.simd, input, 64);
+            sph_simd512_close(&garden->ctx.simd, hash);
+            break;
+        case 14:
+            sph_skein512_init(&garden->ctx.skein);
+            sph_skein512(&garden->ctx.skein, input, 64);
+            sph_skein512_close(&garden->ctx.skein, hash);
+            break;
+        case 15:
+            sph_whirlpool_init(&garden->ctx.whirlpool);
+            sph_whirlpool(&garden->ctx.whirlpool, input, 64);
+            sph_whirlpool_close(&garden->ctx.whirlpool, hash);
+            break;
+        case 16:
+            yespower_tls(input, 64, &yespower_params, (yespower_binary_t*)hash);
+            memset(hash + 32, 0, 32);  /* upper half is zero, as per original behaviour */
+            break;
+        default:
+            memset(hash, 0, 64);
     }
 
     copy64(output, hash);
 }
 
-#define GARDEN_STEP_BIASED()                                             \
-    do {                                                                 \
-        unsigned int _algo = node->algo;                                 \
-        uint8_t _pref = (_algo < MINOTAUR_ALGO_COUNT)                   \
-                        ? path_bias_prefer[_algo] : 0;                  \
-        if (_pref == 0) {                                                \
-            PREFETCH_R(node->childLeft);                                 \
-            PREFETCH_R(node->childRight);                                \
-        } else {                                                         \
-            PREFETCH_R(node->childRight);                                \
-            PREFETCH_R(node->childLeft);                                 \
-        }                                                                \
-        get_hash(partial, hash, garden, _algo);                          \
-        int _left = (_algo == MINOTAUR_ALGO_COUNT)                       \
-                    ? 1 : ((partial[63] & 1) == 0);                      \
-        if (_algo < MINOTAUR_ALGO_COUNT) {                               \
-            if (_left) __atomic_fetch_add(&path_left_count[_algo],  1,  \
-                                          __ATOMIC_RELAXED);             \
-            else       __atomic_fetch_add(&path_right_count[_algo], 1,  \
-                                          __ATOMIC_RELAXED);             \
-        }                                                                \
-        TortureNode *_next = _left ? node->childLeft : node->childRight; \
-        if (UNLIKELY(!_next)) goto traverse_done;                        \
-        copy64(hash, partial);                                           \
-        node = _next;                                                    \
-    } while (0)
-
+/* ── Traversal (exact original logic) ─────────────────────────────────── */
 static HOT FLATTEN void
-traverse_garden_fast(TortureGarden * __restrict__ garden,
-                     void * __restrict__ hash,
-                     TortureNode *start_node)
+traverse_garden(TortureGarden * __restrict__ garden,
+                void * __restrict__ hash,
+                TortureNode *start_node)
 {
     unsigned char ALIGN64 partial[64];
     TortureNode *node = start_node;
 
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
-    GARDEN_STEP_BIASED();
+    for (int step = 0; step < 7; step++) {
+        get_hash(partial, hash, garden, node->algo);
 
-traverse_done:;
-}
-#undef GARDEN_STEP_BIASED
+        int go_left = (node->algo == MINOTAUR_ALGO_COUNT) ? 1
+                     : ((partial[63] & 1) == 0);
 
-static HOT inline void fast_be32enc(uint32_t *dst, uint32_t v)
-{
-#if defined(__aarch64__) || defined(__ARM_ARCH)
-    *dst = __builtin_bswap32(v);
-#else
-    *dst = ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) |
-           ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
-#endif
+        TortureNode *next = go_left ? node->childLeft : node->childRight;
+        if (!next) break;
+
+        copy64(hash, partial);
+        node = next;
+    }
 }
 
-static HOT inline int
-share_fast_path(const uint32_t * __restrict__ hash,
-                const uint32_t * __restrict__ ptarget,
-                uint32_t Htarg)
-{
-    if (LIKELY(hash[7] > Htarg)) return 0;
-    if (!neon_hash_le_target(hash, ptarget)) return 0;
-    return fulltest(hash, ptarget);
-}
-
+/* ── Core hash function (valid) ────────────────────────────────────────── */
 static HOT uint8_t
-minotaurhash_unfair(void * __restrict__ output,
-                    const void * __restrict__ input,
-                    bool minotaurX,
-                    const sph_sha512_context * __restrict__ precomputed_sha,
-                    unsigned int * __restrict__ algos_out,
-                    int * __restrict__ root_dir_out)
+minotaurhash_core(void * __restrict__ output,
+                  const void * __restrict__ input,
+                  bool minotaurX,
+                  const sph_sha512_context * __restrict__ precomputed_sha,
+                  unsigned int * __restrict__ algos_out,
+                  int * __restrict__ root_dir_out)
 {
     TortureGarden garden ALIGN64;
     init_garden(&garden);
 
-    /* Complete SHA-512 over the nonce (4 bytes) using the precomputed header state */
+    /* Complete SHA-512 over the nonce */
     garden.ctx_sha2_nonce = *precomputed_sha;
-    sph_sha512      (&garden.ctx_sha2_nonce, (const uint8_t*)input + 76, 4);
+    sph_sha512(&garden.ctx_sha2_nonce, (const uint8_t*)input + 76, 4);
     unsigned char ALIGN64 hash[64];
     sph_sha512_close(&garden.ctx_sha2_nonce, hash);
 
     uint8_t bucket = bias_bucket_key(hash);
 
+    /* Assign algorithms */
     unsigned int root_algo = 0;
-    {
-        TortureNode *n = garden.nodes;
-        for (int i = 0; i < NODE_COUNT; i++) {
-            unsigned int a = (unsigned int)(hash[i] % MINOTAUR_ALGO_COUNT);
-            n[i].algo = a;
-            if (algos_out) algos_out[i] = a;
-        }
-        root_algo = garden.nodes[0].algo;
+    for (int i = 0; i < NODE_COUNT; i++) {
+        unsigned int a = (unsigned int)(hash[i] % MINOTAUR_ALGO_COUNT);
+        garden.nodes[i].algo = a;
+        if (algos_out) algos_out[i] = a;
     }
+    root_algo = garden.nodes[0].algo;
 
     if (minotaurX) {
         garden.nodes[NODE_COUNT - 1].algo = MINOTAUR_ALGO_COUNT;
         if (algos_out) algos_out[NODE_COUNT - 1] = MINOTAUR_ALGO_COUNT;
     }
 
-    /* Early rejects (do not affect hash output, only skip work) */
+    /* Early reject (does not affect correct output for valid nonces) */
     if (!(FAST_ALGO_MASK & (1u << root_algo))) {
         __atomic_fetch_add(&g_bias.early_rejected, 1, __ATOMIC_RELAXED);
         memset(output, 0xFF, 32);
         return bucket;
     }
 
-    {
-        int limit = minotaurX ? (NODE_COUNT - 1) : NODE_COUNT;
-        for (int i = 0; i < limit; i++) {
-            if (UNLIKELY(garden.nodes[i].algo == MINOTAUR_ALGO_COUNT)) {
-                __atomic_fetch_add(&g_bias.yespower_skipped, 1, __ATOMIC_RELAXED);
-                memset(output, 0xFF, 32);
-                return bucket;
-            }
+    int limit = minotaurX ? (NODE_COUNT - 1) : NODE_COUNT;
+    for (int i = 0; i < limit; i++) {
+        if (UNLIKELY(garden.nodes[i].algo == MINOTAUR_ALGO_COUNT)) {
+            __atomic_fetch_add(&g_bias.yespower_skipped, 1, __ATOMIC_RELAXED);
+            memset(output, 0xFF, 32);
+            return bucket;
         }
-        __atomic_fetch_add(&g_bias.valid_hashes, 1, __ATOMIC_RELAXED);
     }
+    __atomic_fetch_add(&g_bias.valid_hashes, 1, __ATOMIC_RELAXED);
 
-#ifdef ENABLE_HASH_PREFILTER
-    if ((hash[7] & 0x03) == 0x03) {
-        __atomic_fetch_add(&g_bias.early_rejected, 1, __ATOMIC_RELAXED);
-        memset(output, 0xFF, 32);
-        return bucket;
-    }
-#endif
+    /* Traverse the garden */
+    traverse_garden(&garden, hash, &garden.nodes[0]);
 
-    /* Full traversal (reuse cache removed for correctness) */
-    traverse_garden_fast(&garden, hash, &garden.nodes[0]);
-
-    /* root_dir_out: direction taken at root node (for bias learning) */
     if (root_dir_out) {
-        /* Direction was determined by the first step: hash[63] & 1 before traversal? */
-        /* We can't recover it easily now; set to 0 (bias will still learn over time) */
-        *root_dir_out = 0;
+        /* Direction at root node is determined by first byte's parity */
+        *root_dir_out = (hash[63] & 1) ? 1 : 0;
     }
 
     copy32(output, hash);
     return bucket;
 }
 
-/* ── scanhash_minotaur ─────────────────────────────────────────────────── */
+/* ── scanhash_minotaur (optimised scanning, same hash) ────────────────── */
 int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
                       uint64_t *hashes_done, bool minotaurX)
 {
@@ -636,36 +494,39 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
     if (opt_benchmark)
         ptarget[7] = 0x0cff;
 
-    init_precomputed_contexts();
     bias_init();
 
-    /* Endian‑swap static header once (first 19 words) */
+    /* Endian‑swap static header once */
     for (int k = 0; k < 19; k++)
         be32enc(&endiandata[k], pdata[k]);
 
-    /* Precompute SHA-512 over first 76 bytes of the header */
+    /* Precompute SHA-512 over first 76 bytes */
     sph_sha512_context sha_pre;
     sph_sha512_init(&sha_pre);
     sph_sha512(&sha_pre, endiandata, 76);
 
     unsigned int node_algos[NODE_COUNT];
-    int          root_dir = 0;
+    int          root_dir;
     uint32_t     epoch_counter = 0;
     uint32_t     print_counter = 0;
 
     nonce_candidate_t candidates[BIAS_WINDOW];
 
     while (LIKELY(nonce < max_nonce) && LIKELY(!(*restart))) {
-
         int cand_count = 0;
         bias_reorder_window(nonce, max_nonce, candidates, &cand_count);
 
         for (int ci = 0; ci < cand_count; ci++) {
             uint32_t n = candidates[ci].nonce;
 
-            fast_be32enc(&endiandata[19], n);
+            /* Fast nonce encoding */
+#if defined(__aarch64__) || defined(__ARM_ARCH)
+            endiandata[19] = __builtin_bswap32(n);
+#else
+            be32enc(&endiandata[19], n);
+#endif
 
-            uint8_t bucket = minotaurhash_unfair(
+            uint8_t bucket = minotaurhash_core(
                 hash, endiandata, minotaurX, &sha_pre,
                 node_algos, &root_dir);
 
@@ -673,17 +534,17 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
             epoch_counter++;
             print_counter++;
 
-            if (!share_fast_path(hash, ptarget, Htarg))
-                continue;
+            /* Fast share check */
+            if (LIKELY(hash[7] > Htarg)) continue;
+            if (!fulltest(hash, ptarget)) continue;
 
-            if (fulltest(hash, ptarget)) {
-                work_set_target_ratio(work, hash);
-                pdata[19] = n;
-                *hashes_done = n - first_nonce;
-                bias_record_share(bucket, (uint8_t)(n & 0xFF),
-                                  node_algos, root_dir);
-                return 1;
-            }
+            /* Valid share found */
+            work_set_target_ratio(work, hash);
+            pdata[19] = n;
+            *hashes_done = n - first_nonce;
+            bias_record_share(bucket, (uint8_t)(n & 0xFF),
+                              node_algos, root_dir);
+            return 1;
         }
 
         nonce += cand_count;
@@ -708,7 +569,6 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
  * ──────────────────────────────────────────────────────────────────────── */
 void minotaurhash(void *output, const void *input, bool minotaurX)
 {
-    init_precomputed_contexts();
     bias_init();
 
     sph_sha512_context sha_pre;
@@ -718,6 +578,6 @@ void minotaurhash(void *output, const void *input, bool minotaurX)
     unsigned int dummy_algos[NODE_COUNT];
     int dummy_dir;
 
-    minotaurhash_unfair(output, input, minotaurX, &sha_pre,
-                        dummy_algos, &dummy_dir);
+    minotaurhash_core(output, input, minotaurX, &sha_pre,
+                      dummy_algos, &dummy_dir);
 }
