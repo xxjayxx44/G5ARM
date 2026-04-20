@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include <pthread.h>
 
 #include <sha3/sph_blake.h>
@@ -289,7 +290,7 @@ static HOT inline void copy32(void * __restrict__ d, const void * __restrict__ s
 #endif
 }
 
-/* ── Correct get_hash (exact original behaviour) ──────────────────────── */
+/* ── get_hash (exact original behaviour) ───────────────────────────────── */
 static HOT inline void
 get_hash(unsigned char * __restrict__ output,
          const unsigned char * __restrict__ input,
@@ -297,7 +298,7 @@ get_hash(unsigned char * __restrict__ output,
          unsigned int algo)
 {
     unsigned char ALIGN64 hash[64];
-    memset(hash, 0, sizeof(hash));   /* as in original */
+    memset(hash, 0, sizeof(hash));
 
     switch (algo) {
         case 0:
@@ -382,7 +383,7 @@ get_hash(unsigned char * __restrict__ output,
             break;
         case 16:
             yespower_tls(input, 64, &yespower_params, (yespower_binary_t*)hash);
-            memset(hash + 32, 0, 32);  /* upper half is zero, as per original behaviour */
+            memset(hash + 32, 0, 32);
             break;
         default:
             memset(hash, 0, 64);
@@ -391,30 +392,52 @@ get_hash(unsigned char * __restrict__ output,
     copy64(output, hash);
 }
 
-/* ── Traversal (exact original logic) ─────────────────────────────────── */
+/* ── Traversal (fixed: leaf hash is now propagated) ───────────────────── */
 static HOT FLATTEN void
 traverse_garden(TortureGarden * __restrict__ garden,
                 void * __restrict__ hash,
-                TortureNode *start_node)
+                TortureNode *start_node,
+                int *root_dir_out)
 {
     unsigned char ALIGN64 partial[64];
     TortureNode *node = start_node;
+    int step = 0;
 
-    for (int step = 0; step < 7; step++) {
+    /*
+     * The original recursive code does:
+     *   get_hash(partial, hash, ...)
+     *   recurse(child, partial)   // child overwrites partial in-place
+     *   memcpy(hash, partial, 64) // ALWAYS copies, even if no child
+     *
+     * Therefore the final result must be the hash produced by the deepest
+     * visited node.  We emulate that by always copying partial->hash after
+     * each step.  When node->child is NULL (leaf) we copy the leaf hash
+     * and then exit — this is the exact behaviour the original missing
+     * copy64() failed to perform.
+     */
+    while (node != NULL) {
         get_hash(partial, hash, garden, node->algo);
+
+        /* Capture root direction from the ROOT PARTIAL HASH, not the final
+         * hash, so bias statistics track the correct branch. */
+        if (step == 0 && root_dir_out) {
+            *root_dir_out = (partial[63] & 1) ? 1 : 0;
+        }
 
         int go_left = (node->algo == MINOTAUR_ALGO_COUNT) ? 1
                      : ((partial[63] & 1) == 0);
 
         TortureNode *next = go_left ? node->childLeft : node->childRight;
-        if (!next) break;
 
+        /* CRITICAL FIX: always copy, even when next == NULL (leaf). */
         copy64(hash, partial);
+
         node = next;
+        step++;
     }
 }
 
-/* ── Core hash function (valid) ────────────────────────────────────────── */
+/* ── Core hash function ────────────────────────────────────────────────── */
 static HOT uint8_t
 minotaurhash_core(void * __restrict__ output,
                   const void * __restrict__ input,
@@ -465,13 +488,10 @@ minotaurhash_core(void * __restrict__ output,
     }
     __atomic_fetch_add(&g_bias.valid_hashes, 1, __ATOMIC_RELAXED);
 
-    /* Traverse the garden */
-    traverse_garden(&garden, hash, &garden.nodes[0]);
-
-    if (root_dir_out) {
-        /* Direction at root node is determined by first byte's parity */
-        *root_dir_out = (hash[63] & 1) ? 1 : 0;
-    }
+    /* Traverse the garden — root_dir captured inside traversal */
+    int captured_root_dir = 0;
+    traverse_garden(&garden, hash, &garden.nodes[0],
+                    root_dir_out ? root_dir_out : &captured_root_dir);
 
     copy32(output, hash);
     return bucket;
@@ -496,7 +516,7 @@ int scanhash_minotaur(int thr_id, struct work *work, uint32_t max_nonce,
 
     bias_init();
 
-    /* Endian‑swap static header once */
+    /* Endian-swap static header once */
     for (int k = 0; k < 19; k++)
         be32enc(&endiandata[k], pdata[k]);
 
@@ -573,7 +593,7 @@ void minotaurhash(void *output, const void *input, bool minotaurX)
 
     sph_sha512_context sha_pre;
     sph_sha512_init(&sha_pre);
-    sph_sha512(&sha_pre, input, 76);   /* first 76 bytes of 80‑byte header */
+    sph_sha512(&sha_pre, input, 76);   /* first 76 bytes of 80-byte header */
 
     unsigned int dummy_algos[NODE_COUNT];
     int dummy_dir;
