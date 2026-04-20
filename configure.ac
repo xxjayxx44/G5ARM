@@ -41,6 +41,12 @@ AC_CHECK_DECLS([be32dec, le32dec, be32enc, le32enc, le16dec, le16enc], [], [],
 AC_FUNC_ALLOCA
 AC_CHECK_FUNCS([getopt_long])
 
+have_arm=false
+have_aarch64=false
+have_x86=false
+have_x86_64=false
+have_win32=false
+
 MINGW_TARGET=`$CC -dumpmachine 2>&1`
 case $MINGW_TARGET in
   arm*-*-*)
@@ -74,122 +80,144 @@ esac
 
 AC_ARG_ENABLE([assembly],
   AS_HELP_STRING([--disable-assembly], [disable assembly-language routines]))
-if test x$enable_assembly != xno; then
+if test "x$enable_assembly" != "xno"; then
   AC_DEFINE([USE_ASM], [1], [Define to 1 if assembly routines are wanted.])
 fi
 
-if test x$enable_assembly != xno -a x$have_x86_64 = xtrue
+if test "x$enable_assembly" != "xno" -a "x$have_x86_64" = "xtrue"
 then
-  AC_MSG_CHECKING(whether we can compile AVX code)
+  AC_MSG_CHECKING([whether we can compile AVX code])
   AC_COMPILE_IFELSE([AC_LANG_PROGRAM(,[asm ("vmovdqa %ymm0, %ymm1");])],
-    AC_DEFINE(USE_AVX, 1, [Define to 1 if AVX assembly is available.])
-    AC_MSG_RESULT(yes)
-    AC_MSG_CHECKING(whether we can compile XOP code)
-    AC_COMPILE_IFELSE([AC_LANG_PROGRAM(,[asm ("vprotd \$7, %xmm0, %xmm1");])],
-      AC_DEFINE(USE_XOP, 1, [Define to 1 if XOP assembly is available.])
-      AC_MSG_RESULT(yes)
-    ,
-      AC_MSG_RESULT(no)
-      AC_MSG_WARN([The assembler does not support the XOP instruction set.])
-    )
-    AC_MSG_CHECKING(whether we can compile AVX2 code)
-    AC_COMPILE_IFELSE([AC_LANG_PROGRAM(,[asm ("vpaddd %ymm0, %ymm1, %ymm2");])],
-      AC_DEFINE(USE_AVX2, 1, [Define to 1 if AVX2 assembly is available.])
-      AC_MSG_RESULT(yes)
-    ,
-      AC_MSG_RESULT(no)
-      AC_MSG_WARN([The assembler does not support the AVX2 instruction set.])
-    )
-  ,
-    AC_MSG_RESULT(no)
-    AC_MSG_WARN([The assembler does not support the AVX instruction set.])
-  )
+    [
+      AC_DEFINE([USE_AVX], [1], [Define to 1 if AVX assembly is available.])
+      AC_MSG_RESULT([yes])
+      AC_MSG_CHECKING([whether we can compile XOP code])
+      AC_COMPILE_IFELSE([AC_LANG_PROGRAM(,[asm ("vprotd \$7, %xmm0, %xmm1");])],
+        [
+          AC_DEFINE([USE_XOP], [1], [Define to 1 if XOP assembly is available.])
+          AC_MSG_RESULT([yes])
+        ],
+        [
+          AC_MSG_RESULT([no])
+          AC_MSG_WARN([The assembler does not support the XOP instruction set.])
+        ])
+      AC_MSG_CHECKING([whether we can compile AVX2 code])
+      AC_COMPILE_IFELSE([AC_LANG_PROGRAM(,[asm ("vpaddd %ymm0, %ymm1, %ymm2");])],
+        [
+          AC_DEFINE([USE_AVX2], [1], [Define to 1 if AVX2 assembly is available.])
+          AC_MSG_RESULT([yes])
+        ],
+        [
+          AC_MSG_RESULT([no])
+          AC_MSG_WARN([The assembler does not support the AVX2 instruction set.])
+        ])
+    ],
+    [
+      AC_MSG_RESULT([no])
+      AC_MSG_WARN([The assembler does not support the AVX instruction set.])
+    ])
 fi
 
-AC_CHECK_LIB(jansson, json_loads, request_jansson=false, request_jansson=true)
+AC_CHECK_LIB([jansson], [json_loads], [request_jansson=false], [request_jansson=true])
 
 # GC2 for GNU static
 if test "x$OS" = "xWindows_NT" ; then
    # MinGW
-   AC_CHECK_LIB([pthread], [pthread_create], PTHREAD_LIBS="-lpthreadGC2",[])
+   AC_CHECK_LIB([pthread], [pthread_create], [PTHREAD_LIBS="-lpthreadGC2"], [])
 else
-   AC_CHECK_LIB([pthread], [pthread_create], PTHREAD_LIBS="-lpthread",[])
+   AC_CHECK_LIB([pthread], [pthread_create], [PTHREAD_LIBS="-lpthread"], [])
 fi
 
 LDFLAGS="$PTHREAD_LDFLAGS $LDFLAGS"
-# PTHREAD_LIBS="$PTHREAD_LIBS"
 
-AC_MSG_CHECKING(whether __uint128_t is supported)
-AC_COMPILE_IFELSE([AC_LANG_PROGRAM([static __uint128_t i = 100;])],
-      AC_DEFINE(USE_INT128, 1, [Define if __uint128_t is available])
-      AC_MSG_RESULT(yes)
-    ,
-      AC_MSG_RESULT(no)
-)
+AC_MSG_CHECKING([whether __uint128_t is supported])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([static __uint128_t i = 100;], [])],
+    [
+      AC_DEFINE([USE_INT128], [1], [Define if __uint128_t is available])
+      AC_MSG_RESULT([yes])
+    ],
+    [
+      AC_MSG_RESULT([no])
+    ])
 
 # allow if <var> in Makefile.am
-AM_CONDITIONAL([WANT_JANSSON], [test x$request_jansson = xtrue])
-AM_CONDITIONAL([HAVE_WINDOWS], [test x$have_win32 = xtrue])
-AM_CONDITIONAL([USE_ASM], [test x$enable_assembly != xno])
-AM_CONDITIONAL([ARCH_x86], [test x$have_x86 = xtrue])
-AM_CONDITIONAL([ARCH_x86_64], [test x$have_x86_64 = xtrue])
-AM_CONDITIONAL([ARCH_ARM], [test x$have_arm = xtrue])
-AM_CONDITIONAL([ARCH_ARM64], [test x$have_aarch64 = xtrue])
+AM_CONDITIONAL([WANT_JANSSON], [test "x$request_jansson" = "xtrue"])
+AM_CONDITIONAL([HAVE_WINDOWS], [test "x$have_win32" = "xtrue"])
+AM_CONDITIONAL([USE_ASM], [test "x$enable_assembly" != "xno"])
+AM_CONDITIONAL([ARCH_x86], [test "x$have_x86" = "xtrue"])
+AM_CONDITIONAL([ARCH_x86_64], [test "x$have_x86_64" = "xtrue"])
+AM_CONDITIONAL([ARCH_ARM], [test "x$have_arm" = "xtrue"])
+AM_CONDITIONAL([ARCH_ARM64], [test "x$have_aarch64" = "xtrue"])
 AM_CONDITIONAL([MINGW], [test "x$OS" = "xWindows_NT"])
 
-if test x$request_jansson = xtrue ; then
+if test "x$request_jansson" = "xtrue" ; then
 	JANSSON_LIBS="compat/jansson/libjansson.a"
 else
-	JANSSON_LIBS=-ljansson
+	JANSSON_LIBS="-ljansson"
 fi
 
 # libcurl install path (for mingw : --with-curl=/usr/local)
 AC_ARG_WITH([curl],
-   [  --with-curl=PATH         prefix where curl is installed [default=/usr]])
+   [AS_HELP_STRING([--with-curl=PATH], [prefix where curl is installed [default=/usr]])])
+
+# SSL install path (for mingw : --with-crypto=/usr/local/ssl)
+AC_ARG_WITH([crypto],
+   [AS_HELP_STRING([--with-crypto=PATH], [prefix where openssl crypto is installed [default=/usr]])])
+
+LIBCURL_CFLAGS=""
+LIBCURL_CPPFLAGS=""
+LIBCURL_LDFLAGS=""
+LIBCURL_LIBS=""
 
 if test -n "$with_curl" ; then
    LIBCURL_CFLAGS="$LIBCURL_CFLAGS -I$with_curl/include"
    LIBCURL_CPPFLAGS="$LIBCURL_CPPFLAGS -I$with_curl/include"
-   LIBCURL_LDFLAGS="-L$with_curl/lib $LIBCURL_LDFLAGS"
-   LIBCURL="-lcurl"
+   LIBCURL_LDFLAGS="$LIBCURL_LDFLAGS -L$with_curl/lib"
 fi
-
-# SSL install path (for mingw : --with-crypto=/usr/local/ssl)
-AC_ARG_WITH([crypto],
-   [  --with-crypto=PATH       prefix where openssl crypto is installed [default=/usr]])
 
 if test -n "$with_crypto" ; then
    LIBCURL_CFLAGS="$LIBCURL_CFLAGS -I$with_crypto/include"
    LIBCURL_CPPFLAGS="$LIBCURL_CPPFLAGS -I$with_crypto/include"
-   LIBCURL_LDFLAGS="-L$with_crypto/lib $LIBCURL_LDFLAGS"
-   LIBCURL="$LIBCURL -lssl -lcrypto"
+   LIBCURL_LDFLAGS="$LIBCURL_LDFLAGS -L$with_crypto/lib"
 fi
 
-CFLAGS="$CFLAGS $LIBCURL_CFLAGS"
 CPPFLAGS="$CPPFLAGS $LIBCURL_CPPFLAGS"
-LDFLAGS="$LDFLAGS"
+CFLAGS="$CFLAGS $LIBCURL_CFLAGS"
+LDFLAGS="$LDFLAGS $LIBCURL_LDFLAGS"
 
-AC_CHECK_LIB([z],[gzopen],[],[])
-AC_CHECK_LIB([crypto],[EVP_DigestFinal_ex], crypto=yes, [AC_MSG_ERROR([OpenSSL crypto library required])])
-AC_CHECK_LIB([ssl],[SSL_free], ssl=yes, ssl=no)
+AC_CHECK_HEADERS([zlib.h curl/curl.h openssl/sha.h openssl/ssl.h],
+  [], [])
 
-# AC_CHECK_LIB([curl], [curl_multi_timeout],
-#    have_libcurl=yes,
-#    have_libcurl=no AC_MSG_ERROR([curl library required])
-# )
+AC_CHECK_LIB([z], [gzopen],
+  [ZLIB_LIBS="-lz"],
+  [AC_MSG_ERROR([zlib library required])])
 
-# LIBCURL_CHECK_CONFIG([yes], 7.15, curlconfig=yes, curlconfig=no)
+AC_CHECK_LIB([crypto], [EVP_DigestFinal_ex],
+  [CRYPTO_LIBS="-lcrypto"],
+  [AC_MSG_ERROR([OpenSSL crypto library required])])
 
-AC_SUBST(LIBCURL)
-AC_SUBST(LIBCURL_CFLAGS)
-AC_SUBST(LIBCURL_CPPFLAGS)
-# AC_SUBST(LIBCURL_LDFLAGS)
+AC_CHECK_LIB([ssl], [SSL_free],
+  [SSL_LIBS="-lssl"],
+  [AC_MSG_ERROR([OpenSSL ssl library required])])
 
-AC_SUBST(JANSSON_LIBS)
-AC_SUBST(PTHREAD_FLAGS)
-AC_SUBST(PTHREAD_LIBS)
-AC_SUBST(WS2_LIBS)
-AC_SUBST(LIBTOOL_APP_LDFLAGS)
+AC_CHECK_LIB([curl], [curl_easy_init],
+  [CURL_LIBS="-lcurl"],
+  [AC_MSG_ERROR([curl library required])])
+
+dnl Keep dependency order friendly for static/Termux-style linking:
+dnl curl often depends on ssl/crypto/z.
+LIBCURL="$CURL_LIBS $SSL_LIBS $CRYPTO_LIBS $ZLIB_LIBS"
+
+AC_SUBST([LIBCURL])
+AC_SUBST([LIBCURL_CFLAGS])
+AC_SUBST([LIBCURL_CPPFLAGS])
+AC_SUBST([LIBCURL_LDFLAGS])
+
+AC_SUBST([JANSSON_LIBS])
+AC_SUBST([PTHREAD_FLAGS])
+AC_SUBST([PTHREAD_LIBS])
+AC_SUBST([WS2_LIBS])
+AC_SUBST([LIBTOOL_APP_LDFLAGS])
 
 ac_configure_args="${ac_configure_args} --disable-shared --with-pic --with-bignum=no --enable-module-recovery --disable-jni"
 AC_CONFIG_SUBDIRS([secp256k1])
@@ -197,8 +225,9 @@ AC_CONFIG_FILES([
 	Makefile
 	compat/Makefile
 	compat/jansson/Makefile
-	])
+])
 AC_OUTPUT
+
 echo
 echo "  CC            = $CC"
 echo "  CFLAGS        = $CFLAGS"
@@ -206,5 +235,8 @@ echo "  CPPFLAGS      = $CPPFLAGS"
 echo "  CXX           = $CXX"
 echo "  CXXFLAGS      = $CXXFLAGS"
 echo "  LDFLAGS       = $LDFLAGS"
+echo "  LIBCURL       = $LIBCURL"
+echo "  JANSSON_LIBS  = $JANSSON_LIBS"
+echo "  PTHREAD_LIBS  = $PTHREAD_LIBS"
+echo "  WS2_LIBS      = $WS2_LIBS"
 echo "  ARFLAGS       = $ARFLAGS"
-echo
