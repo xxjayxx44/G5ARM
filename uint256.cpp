@@ -7,7 +7,8 @@ extern "C"{
 #include "miner.h"
 
 // compute the diff ratio between a found hash and the target
-double hash_target_ratio(uint32_t* hash, uint32_t* target)
+// (added const to hash parameter for consistency)
+double hash_target_ratio(const uint32_t* hash, uint32_t* target)
 {
 	uint256 h, t;
 	double dhash;
@@ -26,10 +27,12 @@ double hash_target_ratio(uint32_t* hash, uint32_t* target)
 }
 
 // store the share ratio in work struct
-void work_set_target_ratio(struct work* work, uint32_t* hash)
+// FIXED: added const to hash parameter to match miner.h
+void work_set_target_ratio(struct work* work, const uint32_t* hash)
 {
 	// only if the option is enabled (to reduce cpu usage)
 	if (opt_showdiff && work) {
+		// Cast away const inside – safe because hash_target_ratio only reads
 		work->shareratio = hash_target_ratio(hash, work->target);
 		work->sharediff = work->targetdiff * work->shareratio;
 		if (opt_debug)
