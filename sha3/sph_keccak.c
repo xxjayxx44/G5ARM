@@ -1,35 +1,3 @@
-/* $Id: keccak.c 259 2011-07-19 22:11:27Z tp $ */
-/*
- * Keccak implementation.
- *
- * ==========================(LICENSE BEGIN)============================
- *
- * Copyright (c) 2007-2010  Projet RNRT SAPHIR
- * 
- * Permission is hereby granted, free of charge, to any person obtaining
- * a copy of this software and associated documentation files (the
- * "Software"), to deal in the Software without restriction, including
- * without limitation the rights to use, copy, modify, merge, publish,
- * distribute, sublicense, and/or sell copies of the Software, and to
- * permit persons to whom the Software is furnished to do so, subject to
- * the following conditions:
- * 
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- * 
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
- * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
- * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
- * ===========================(LICENSE END)=============================
- *
- * @author   Thomas Pornin <thomas.pornin@cryptolog.com>
- */
-
 #include <stddef.h>
 #include <string.h>
 
@@ -39,74 +7,19 @@
 extern "C"{
 #endif
 
-/*
- * Parameters:
- *
- *  SPH_KECCAK_64          use a 64-bit type
- *  SPH_KECCAK_UNROLL      number of loops to unroll (0/undef for full unroll)
- *  SPH_KECCAK_INTERLEAVE  use bit-interleaving (32-bit type only)
- *  SPH_KECCAK_NOCOPY      do not copy the state into local variables
- * 
- * If there is no usable 64-bit type, the code automatically switches
- * back to the 32-bit implementation.
- *
- * Some tests on an Intel Core2 Q6600 (both 64-bit and 32-bit, 32 kB L1
- * code cache), a PowerPC (G3, 32 kB L1 code cache), an ARM920T core
- * (16 kB L1 code cache), and a small MIPS-compatible CPU (Broadcom BCM3302,
- * 8 kB L1 code cache), seem to show that the following are optimal:
- *
- * -- x86, 64-bit: use the 64-bit implementation, unroll 8 rounds,
- * do not copy the state; unrolling 2, 6 or all rounds also provides
- * near-optimal performance.
- * -- x86, 32-bit: use the 32-bit implementation, unroll 6 rounds,
- * interleave, do not copy the state. Unrolling 1, 2, 4 or 8 rounds
- * also provides near-optimal performance.
- * -- PowerPC: use the 64-bit implementation, unroll 8 rounds,
- * copy the state. Unrolling 4 or 6 rounds is near-optimal.
- * -- ARM: use the 64-bit implementation, unroll 2 or 4 rounds,
- * copy the state.
- * -- MIPS: use the 64-bit implementation, unroll 2 rounds, copy
- * the state. Unrolling only 1 round is also near-optimal.
- *
- * Also, interleaving does not always yield actual improvements when
- * using a 32-bit implementation; in particular when the architecture
- * does not offer a native rotation opcode (interleaving replaces one
- * 64-bit rotation with two 32-bit rotations, which is a gain only if
- * there is a native 32-bit rotation opcode and not a native 64-bit
- * rotation opcode; also, interleaving implies a small overhead when
- * processing input words).
- *
- * To sum up:
- * -- when possible, use the 64-bit code
- * -- exception: on 32-bit x86, use 32-bit code
- * -- when using 32-bit code, use interleaving
- * -- copy the state, except on x86
- * -- unroll 8 rounds on "big" machine, 2 rounds on "small" machines
- */
-
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_KECCAK
 #define SPH_SMALL_FOOTPRINT_KECCAK   1
 #endif
 
-/*
- * By default, we select the 64-bit implementation if a 64-bit type
- * is available, unless a 32-bit x86 is detected.
- */
 #if !defined SPH_KECCAK_64 && SPH_64 \
 	&& !(defined __i386__ || SPH_I386_GCC || SPH_I386_MSVC)
 #define SPH_KECCAK_64   1
 #endif
 
-/*
- * If using a 32-bit implementation, we prefer to interleave.
- */
 #if !SPH_KECCAK_64 && !defined SPH_KECCAK_INTERLEAVE
 #define SPH_KECCAK_INTERLEAVE   1
 #endif
 
-/*
- * Unroll 8 rounds on big systems, 2 rounds on small systems.
- */
 #ifndef SPH_KECCAK_UNROLL
 #if SPH_SMALL_FOOTPRINT_KECCAK
 #define SPH_KECCAK_UNROLL   2
@@ -115,10 +28,6 @@ extern "C"{
 #endif
 #endif
 
-/*
- * We do not want to copy the state to local variables on x86 (32-bit
- * and 64-bit alike).
- */
 #ifndef SPH_KECCAK_NOCOPY
 #if defined __i386__ || defined __x86_64 || SPH_I386_MSVC || SPH_I386_GCC
 #define SPH_KECCAK_NOCOPY   1
@@ -129,6 +38,16 @@ extern "C"{
 
 #ifdef _MSC_VER
 #pragma warning (disable: 4146)
+#endif
+
+#ifndef KECCAK_MINER_RATE
+#define KECCAK_MINER_RATE       136
+#endif
+#ifndef KECCAK_MINER_OUTLEN
+#define KECCAK_MINER_OUTLEN     32
+#endif
+#ifndef KECCAK_MINER_MSGLEN
+#define KECCAK_MINER_MSGLEN     80
 #endif
 
 #if SPH_KECCAK_64
@@ -1017,7 +936,6 @@ static const struct {
 	b20, b21, b22, b23, b24, b30, b31, b32, b33, b34, \
 	b40, b41, b42, b43, b44) \
 	do { \
-		/* ROL64(b00, b00,  0); */ \
 		ROL64(b01, b01, 36); \
 		ROL64(b02, b02,  3); \
 		ROL64(b03, b03, 41); \
@@ -1043,17 +961,6 @@ static const struct {
 		ROL64(b43, b43,  8); \
 		ROL64(b44, b44, 14); \
 	} while (0)
-
-/*
- * The KHI macro integrates the "lane complement" optimization. On input,
- * some words are complemented:
- *    a00 a01 a02 a04 a13 a20 a21 a22 a30 a33 a34 a43
- * On output, the following words are complemented:
- *    a04 a10 a20 a22 a23 a31
- *
- * The (implicit) permutation and the theta expansion will bring back
- * the input mask for the next round.
- */
 
 #define KHI_XO(d, a, b, c)   do { \
 		DECL64(kt); \
@@ -1530,9 +1437,6 @@ keccak_init(sph_keccak_context *kc, unsigned out_size)
 #if SPH_KECCAK_64
 	for (i = 0; i < 25; i ++)
 		kc->u.wide[i] = 0;
-	/*
-	 * Initialization for the "lane complement".
-	 */
 	kc->u.wide[ 1] = SPH_C64(0xFFFFFFFFFFFFFFFF);
 	kc->u.wide[ 2] = SPH_C64(0xFFFFFFFFFFFFFFFF);
 	kc->u.wide[ 8] = SPH_C64(0xFFFFFFFFFFFFFFFF);
@@ -1543,11 +1447,6 @@ keccak_init(sph_keccak_context *kc, unsigned out_size)
 
 	for (i = 0; i < 50; i ++)
 		kc->u.narrow[i] = 0;
-	/*
-	 * Initialization for the "lane complement".
-	 * Note: since we set to all-one full 64-bit words,
-	 * interleaving (if applicable) is a no-op.
-	 */
 	kc->u.narrow[ 2] = SPH_C32(0xFFFFFFFF);
 	kc->u.narrow[ 3] = SPH_C32(0xFFFFFFFF);
 	kc->u.narrow[ 4] = SPH_C32(0xFFFFFFFF);
@@ -1611,7 +1510,7 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 		unsigned eb; \
 		union { \
 			unsigned char tmp[lim + 1]; \
-			sph_u64 dummy;   /* for alignment */ \
+			sph_u64 dummy; \
 		} u; \
 		size_t j; \
  \
@@ -1633,7 +1532,6 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 			u.tmp[j - 1] = 0x80; \
 		} \
 		keccak_core(kc, u.tmp, j, lim); \
-		/* Finalize the "lane complement" */ \
 		kc->u.wide[ 1] = ~kc->u.wide[ 1]; \
 		kc->u.wide[ 2] = ~kc->u.wide[ 2]; \
 		kc->u.wide[ 8] = ~kc->u.wide[ 8]; \
@@ -1644,7 +1542,7 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 			sph_enc64le_aligned(u.tmp + j, kc->u.wide[j >> 3]); \
 		memcpy(dst, u.tmp, d); \
 		keccak_init(kc, (unsigned)d << 3); \
-	} \
+	}
 
 #else
 
@@ -1655,7 +1553,7 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 		unsigned eb; \
 		union { \
 			unsigned char tmp[lim + 1]; \
-			sph_u64 dummy;   /* for alignment */ \
+			sph_u64 dummy; \
 		} u; \
 		size_t j; \
  \
@@ -1677,7 +1575,6 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 			u.tmp[j - 1] = 0x80; \
 		} \
 		keccak_core(kc, u.tmp, j, lim); \
-		/* Finalize the "lane complement" */ \
 		kc->u.narrow[ 2] = ~kc->u.narrow[ 2]; \
 		kc->u.narrow[ 3] = ~kc->u.narrow[ 3]; \
 		kc->u.narrow[ 4] = ~kc->u.narrow[ 4]; \
@@ -1690,14 +1587,13 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 		kc->u.narrow[35] = ~kc->u.narrow[35]; \
 		kc->u.narrow[40] = ~kc->u.narrow[40]; \
 		kc->u.narrow[41] = ~kc->u.narrow[41]; \
-		/* un-interleave */ \
 		for (j = 0; j < 50; j += 2) \
 			UNINTERLEAVE(kc->u.narrow[j], kc->u.narrow[j + 1]); \
 		for (j = 0; j < d; j += 4) \
 			sph_enc32le_aligned(u.tmp + j, kc->u.narrow[j >> 2]); \
 		memcpy(dst, u.tmp, d); \
 		keccak_init(kc, (unsigned)d << 3); \
-	} \
+	}
 
 #endif
 
@@ -1706,118 +1602,266 @@ DEFCLOSE(32, 136)
 DEFCLOSE(48, 104)
 DEFCLOSE(64, 72)
 
-/* see sph_keccak.h */
+typedef struct {
+	sph_keccak_context ctx;
+	size_t ptr;
+	unsigned char final_block[KECCAK_MINER_RATE];
+	size_t nonce_offset;
+	size_t nonce_len;
+} keccak_miner_midstate;
+
+void keccak_miner_save_midstate(
+	sph_keccak_context *ctx,
+	const void *prefix, size_t prefix_len,
+	keccak_miner_midstate *midstate)
+{
+	keccak_core(ctx, prefix, prefix_len, KECCAK_MINER_RATE);
+	midstate->ctx = *ctx;
+	midstate->ptr = ctx->ptr;
+}
+
+void keccak_miner_precompute_final_block(
+	keccak_miner_midstate *midstate,
+	const void *suffix, size_t suffix_len,
+	size_t nonce_offset, size_t nonce_len)
+{
+	unsigned char *blk = midstate->final_block;
+	size_t i;
+	size_t last_block_len = KECCAK_MINER_MSGLEN % KECCAK_MINER_RATE;
+	if (last_block_len == 0)
+		last_block_len = KECCAK_MINER_RATE;
+
+	midstate->nonce_offset = nonce_offset;
+	midstate->nonce_len = nonce_len;
+
+	memset(blk, 0, KECCAK_MINER_RATE);
+
+	if (suffix != NULL && suffix_len > 0) {
+		memcpy(blk + nonce_offset + nonce_len, suffix, suffix_len);
+	}
+
+	blk[last_block_len] ^= 0x01;
+	blk[KECCAK_MINER_RATE - 1] ^= 0x80;
+}
+
+void keccak_miner_clone_midstate(
+	const keccak_miner_midstate *midstate,
+	sph_keccak_context *ctx)
+{
+	*ctx = midstate->ctx;
+}
+
+void keccak_miner_patch_nonce32(
+	sph_keccak_context *ctx,
+	const keccak_miner_midstate *midstate,
+	uint32_t nonce)
+{
+	size_t lane = midstate->nonce_offset / 8;
+	size_t shift = (midstate->nonce_offset % 8) * 8;
+
+#if SPH_KECCAK_64
+	sph_u64 mask;
+	sph_u64 val;
+
+	val = (sph_u64)nonce;
+	mask = ((sph_u64)0xFFFFFFFFULL) << shift;
+	ctx->u.wide[lane] &= ~mask;
+	ctx->u.wide[lane] |= (val << shift) & mask;
+#else
+	size_t word_idx = (midstate->nonce_offset / 4);
+	sph_u32 mask = 0xFFFFFFFFUL;
+	sph_u32 val = (sph_u32)nonce;
+
+	ctx->u.narrow[word_idx] &= ~mask;
+	ctx->u.narrow[word_idx] |= val;
+#endif
+}
+
+int keccak_miner_check_target256(
+	sph_keccak_context *ctx,
+	const keccak_miner_midstate *midstate,
+	uint32_t nonce,
+	const unsigned char target[32])
+{
+	DECL_STATE
+	unsigned char tmp[KECCAK_MINER_RATE];
+	size_t i;
+	int cmp;
+
+	*ctx = midstate->ctx;
+
+	keccak_miner_patch_nonce32(ctx, midstate, nonce);
+
+	READ_STATE(ctx);
+#if SPH_KECCAK_64
+	for (i = 0; i < KECCAK_MINER_RATE; i += 8) {
+		ctx->u.wide[i >> 3] ^= sph_dec64le_aligned(midstate->final_block + i);
+	}
+#else
+	for (i = 0; i < KECCAK_MINER_RATE; i += 8) {
+		sph_u32 tl, th;
+		tl = sph_dec32le_aligned(midstate->final_block + i + 0);
+		th = sph_dec32le_aligned(midstate->final_block + i + 4);
+		INTERLEAVE(tl, th);
+		ctx->u.narrow[(i >> 2) + 0] ^= tl;
+		ctx->u.narrow[(i >> 2) + 1] ^= th;
+	}
+#endif
+	WRITE_STATE(ctx);
+
+	READ_STATE(ctx);
+	KECCAK_F_1600;
+#if SPH_KECCAK_64
+	ctx->u.wide[ 1] = ~ctx->u.wide[ 1];
+	ctx->u.wide[ 2] = ~ctx->u.wide[ 2];
+	ctx->u.wide[ 8] = ~ctx->u.wide[ 8];
+	ctx->u.wide[12] = ~ctx->u.wide[12];
+	ctx->u.wide[17] = ~ctx->u.wide[17];
+	ctx->u.wide[20] = ~ctx->u.wide[20];
+#else
+	ctx->u.narrow[ 2] = ~ctx->u.narrow[ 2];
+	ctx->u.narrow[ 3] = ~ctx->u.narrow[ 3];
+	ctx->u.narrow[ 4] = ~ctx->u.narrow[ 4];
+	ctx->u.narrow[ 5] = ~ctx->u.narrow[ 5];
+	ctx->u.narrow[16] = ~ctx->u.narrow[16];
+	ctx->u.narrow[17] = ~ctx->u.narrow[17];
+	ctx->u.narrow[24] = ~ctx->u.narrow[24];
+	ctx->u.narrow[25] = ~ctx->u.narrow[25];
+	ctx->u.narrow[34] = ~ctx->u.narrow[34];
+	ctx->u.narrow[35] = ~ctx->u.narrow[35];
+	ctx->u.narrow[40] = ~ctx->u.narrow[40];
+	ctx->u.narrow[41] = ~ctx->u.narrow[41];
+#endif
+	WRITE_STATE(ctx);
+
+#if SPH_KECCAK_64
+	for (i = 0; i < 32; i += 8) {
+		sph_u64 w = ctx->u.wide[i >> 3];
+		unsigned char out[8];
+		sph_enc64le_aligned(out, w);
+		int j;
+		for (j = 7; j >= 0; j--) {
+			unsigned char tbyte = target[i + (7 - j)];
+			if (out[j] < tbyte)
+				return 1;
+			if (out[j] > tbyte)
+				return 0;
+		}
+	}
+	return 1;
+#else
+	for (i = 0; i < 32; i += 4) {
+		sph_u32 w = ctx->u.narrow[i >> 2];
+		unsigned char out[4];
+		sph_enc32le_aligned(out, w);
+		int j;
+		for (j = 3; j >= 0; j--) {
+			unsigned char tbyte = target[i + (3 - j)];
+			if (out[j] < tbyte)
+				return 1;
+			if (out[j] > tbyte)
+				return 0;
+		}
+	}
+	return 1;
+#endif
+}
+
 void
 sph_keccak224_init(void *cc)
 {
 	keccak_init(cc, 224);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak224(void *cc, const void *data, size_t len)
 {
 	keccak_core(cc, data, len, 144);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak224_close(void *cc, void *dst)
 {
 	sph_keccak224_addbits_and_close(cc, 0, 0, dst);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak224_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
 {
 	keccak_close28(cc, ub, n, dst);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak256_init(void *cc)
 {
 	keccak_init(cc, 256);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak256(void *cc, const void *data, size_t len)
 {
 	keccak_core(cc, data, len, 136);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak256_close(void *cc, void *dst)
 {
 	sph_keccak256_addbits_and_close(cc, 0, 0, dst);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak256_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
 {
 	keccak_close32(cc, ub, n, dst);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak384_init(void *cc)
 {
 	keccak_init(cc, 384);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak384(void *cc, const void *data, size_t len)
 {
 	keccak_core(cc, data, len, 104);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak384_close(void *cc, void *dst)
 {
 	sph_keccak384_addbits_and_close(cc, 0, 0, dst);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak384_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
 {
 	keccak_close48(cc, ub, n, dst);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak512_init(void *cc)
 {
 	keccak_init(cc, 512);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak512(void *cc, const void *data, size_t len)
 {
 	keccak_core(cc, data, len, 72);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak512_close(void *cc, void *dst)
 {
 	sph_keccak512_addbits_and_close(cc, 0, 0, dst);
 }
 
-/* see sph_keccak.h */
 void
 sph_keccak512_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
 {
 	keccak_close64(cc, ub, n, dst);
 }
-
 
 #ifdef __cplusplus
 }
