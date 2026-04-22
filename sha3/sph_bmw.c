@@ -246,22 +246,23 @@ static const unsigned char s_rot_off[11] = { 0,1,3,4,7,10,11,0,0,0,0 };
 
 /* -------------------------------------------------------------------------
  * Word‑schedule templating – fully expanded expand1/2 for 32‑bit
+ * Uses token pasting to map indices to register variables q0..q31
  * ------------------------------------------------------------------------- */
 #define EXPAND1_S_TEMPLATE(i16, i0,i1,i2,i3,i4,i5,i6,i7,i8,i9,i10,i11,i12,i13,i14,i15, \
                            i0m,i1m,i3m,i4m,i7m,i10m,i11m) \
-    (ss1(Q[i0]) + ss2(Q[i1]) + ss3(Q[i2]) + ss0(Q[i3]) + \
-     ss1(Q[i4]) + ss2(Q[i5]) + ss3(Q[i6]) + ss0(Q[i7]) + \
-     ss1(Q[i8]) + ss2(Q[i9]) + ss3(Q[i10]) + ss0(Q[i11]) + \
-     ss1(Q[i12]) + ss2(Q[i13]) + ss3(Q[i14]) + ss0(Q[i15]) + \
+    (ss1(q##i0) + ss2(q##i1) + ss3(q##i2) + ss0(q##i3) + \
+     ss1(q##i4) + ss2(q##i5) + ss3(q##i6) + ss0(q##i7) + \
+     ss1(q##i8) + ss2(q##i9) + ss3(q##i10) + ss0(q##i11) + \
+     ss1(q##i12) + ss2(q##i13) + ss3(q##i14) + ss0(q##i15) + \
      (SPH_T32(SPH_ROTL32(M[i0m], (i1m)) + SPH_ROTL32(M[i3m], (i4m)) - \
               SPH_ROTL32(M[i10m], (i11m)) + Ks_pre[(i16)-16]) ^ H[i7m]))
 
 #define EXPAND2_S_TEMPLATE(i16, i0,i1,i2,i3,i4,i5,i6,i7,i8,i9,i10,i11,i12,i13,i14,i15, \
                            i0m,i1m,i3m,i4m,i7m,i10m,i11m) \
-    (Q[i0] + rs1(Q[i1]) + Q[i2] + rs2(Q[i3]) + \
-     Q[i4] + rs3(Q[i5]) + Q[i6] + rs4(Q[i7]) + \
-     Q[i8] + rs5(Q[i9]) + Q[i10] + rs6(Q[i11]) + \
-     Q[i12] + rs7(Q[i13]) + ss4(Q[i14]) + ss5(Q[i15]) + \
+    (q##i0 + rs1(q##i1) + q##i2 + rs2(q##i3) + \
+     q##i4 + rs3(q##i5) + q##i6 + rs4(q##i7) + \
+     q##i8 + rs5(q##i9) + q##i10 + rs6(q##i11) + \
+     q##i12 + rs7(q##i13) + ss4(q##i14) + ss5(q##i15) + \
      (SPH_T32(SPH_ROTL32(M[i0m], (i1m)) + SPH_ROTL32(M[i3m], (i4m)) - \
               SPH_ROTL32(M[i10m], (i11m)) + Ks_pre[(i16)-16]) ^ H[i7m]))
 
@@ -376,18 +377,18 @@ bmw64_compress_unrolled(const sph_u64 * SPH_RESTRICT M,
     /* Expand Q[16..31] with templated 64‑bit macros */
     #define EXPAND1_B_TEMPLATE(i16, i0,i1,i2,i3,i4,i5,i6,i7,i8,i9,i10,i11,i12,i13,i14,i15, \
                                i0m,i1m,i3m,i4m,i7m,i10m,i11m) \
-        (sb1(Q[i0]) + sb2(Q[i1]) + sb3(Q[i2]) + sb0(Q[i3]) + \
-         sb1(Q[i4]) + sb2(Q[i5]) + sb3(Q[i6]) + sb0(Q[i7]) + \
-         sb1(Q[i8]) + sb2(Q[i9]) + sb3(Q[i10]) + sb0(Q[i11]) + \
-         sb1(Q[i12]) + sb2(Q[i13]) + sb3(Q[i14]) + sb0(Q[i15]) + \
+        (sb1(q##i0) + sb2(q##i1) + sb3(q##i2) + sb0(q##i3) + \
+         sb1(q##i4) + sb2(q##i5) + sb3(q##i6) + sb0(q##i7) + \
+         sb1(q##i8) + sb2(q##i9) + sb3(q##i10) + sb0(q##i11) + \
+         sb1(q##i12) + sb2(q##i13) + sb3(q##i14) + sb0(q##i15) + \
          (SPH_T64(SPH_ROTL64(M[i0m], (i1m)) + SPH_ROTL64(M[i3m], (i4m)) - \
                   SPH_ROTL64(M[i10m], (i11m)) + Kb_pre[(i16)-16]) ^ H[i7m]))
     #define EXPAND2_B_TEMPLATE(i16, i0,i1,i2,i3,i4,i5,i6,i7,i8,i9,i10,i11,i12,i13,i14,i15, \
                                i0m,i1m,i3m,i4m,i7m,i10m,i11m) \
-        (Q[i0] + rb1(Q[i1]) + Q[i2] + rb2(Q[i3]) + \
-         Q[i4] + rb3(Q[i5]) + Q[i6] + rb4(Q[i7]) + \
-         Q[i8] + rb5(Q[i9]) + Q[i10] + rb6(Q[i11]) + \
-         Q[i12] + rb7(Q[i13]) + sb4(Q[i14]) + sb5(Q[i15]) + \
+        (q##i0 + rb1(q##i1) + q##i2 + rb2(q##i3) + \
+         q##i4 + rb3(q##i5) + q##i6 + rb4(q##i7) + \
+         q##i8 + rb5(q##i9) + q##i10 + rb6(q##i11) + \
+         q##i12 + rb7(q##i13) + sb4(q##i14) + sb5(q##i15) + \
          (SPH_T64(SPH_ROTL64(M[i0m], (i1m)) + SPH_ROTL64(M[i3m], (i4m)) - \
                   SPH_ROTL64(M[i10m], (i11m)) + Kb_pre[(i16)-16]) ^ H[i7m]))
 
@@ -826,6 +827,7 @@ bmw32_compress_avx2(const __m256i *SPH_RESTRICT m,
     __m256i q[32];
     __m256i xl, xh;
     __m256i t[16];
+    int j;
 
     q[0] = _mm256_add_epi32(VSS0(_mm256_add_epi32(
                _mm256_sub_epi32(VXOR(m,h,5), VXOR(m,h,7)),
@@ -993,10 +995,7 @@ bmw32_compress_avx2(const __m256i *SPH_RESTRICT m,
         _mm256_xor_si256(_mm256_xor_si256(_mm256_srli_epi32(xl, 2), q[22]), q[15])
     );
 
-    dh[0] = t[0];  dh[1] = t[1];  dh[2] = t[2];  dh[3] = t[3];
-    dh[4] = t[4];  dh[5] = t[5];  dh[6] = t[6];  dh[7] = t[7];
-    dh[8] = t[8];  dh[9] = t[9];  dh[10] = t[10]; dh[11] = t[11];
-    dh[12] = t[12]; dh[13] = t[13]; dh[14] = t[14]; dh[15] = t[15];
+    for (j = 0; j < 16; j++) dh[j] = t[j];
 }
 
 #undef VXOR
@@ -1123,6 +1122,7 @@ bmw64_compress_avx2(const __m256i *SPH_RESTRICT m,
     __m256i q[32];
     __m256i xl, xh;
     __m256i t[16];
+    int j;
 
     q[0] = _mm256_add_epi64(VSB0(_mm256_add_epi64(
                _mm256_sub_epi64(VXOR64(m,h,5), VXOR64(m,h,7)),
@@ -1290,10 +1290,7 @@ bmw64_compress_avx2(const __m256i *SPH_RESTRICT m,
         _mm256_xor_si256(_mm256_xor_si256(_mm256_srli_epi64(xl, 2), q[22]), q[15])
     );
 
-    dh[0] = t[0];  dh[1] = t[1];  dh[2] = t[2];  dh[3] = t[3];
-    dh[4] = t[4];  dh[5] = t[5];  dh[6] = t[6];  dh[7] = t[7];
-    dh[8] = t[8];  dh[9] = t[9];  dh[10] = t[10]; dh[11] = t[11];
-    dh[12] = t[12]; dh[13] = t[13]; dh[14] = t[14]; dh[15] = t[15];
+    for (j = 0; j < 16; j++) dh[j] = t[j];
 }
 
 #undef VXOR64
