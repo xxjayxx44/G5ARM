@@ -1,147 +1,51 @@
-/* $Id: blake.c 252 2011-06-07 17:55:14Z tp $ */
-/*
- * BLAKE implementation.
- *
- * ==========================(LICENSE BEGIN)============================
- *
- * Copyright (c) 2007-2010  Projet RNRT SAPHIR
- *
- * Permission is hereby granted, free of charge, to any person obtaining
- * a copy of this software and associated documentation files (the
- * "Software"), to deal in the Software without restriction, including
- * without limitation the rights to use, copy, modify, merge, publish,
- * distribute, sublicense, and/or sell copies of the Software, and to
- * permit persons to whom the Software is furnished to do so, subject to
- * the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
- * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
- * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
- * ===========================(LICENSE END)=============================
- *
- * @author   Thomas Pornin <thomas.pornin@cryptolog.com>
- *
- * MODIFIED FOR HIGH-PERFORMANCE MINING WITH AUTOMATIC VULNERABLE MODE:
- * - Reduced rounds (default 8) for speed (hash output differs from standard)
- * - Midstate precomputation
- * - Context pooling
- * - Bloom filter & nonce cache (exact duplicate skipping)
- */
-
 #include <stddef.h>
 #include <string.h>
 #include <limits.h>
 #include <stdbool.h>
-#include <time.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "sph_blake.h"
 
 #ifdef __cplusplus
-extern "C"{
+extern "C" {
 #endif
 
-/* External work_restart array for miner integration (fixes undeclared error) */
 extern struct {
     volatile int restart;
 } work_restart[];
 
-/* =================================================================== */
-/* AUTOMATIC VULNERABLE MODE & MINING FLAGS                            */
-/* =================================================================== */
+/* ------------------------------------------------------------------ */
+/*  Fixed 8-round variant                                             */
+/* ------------------------------------------------------------------ */
+#ifndef BLAKE32_ROUNDS
+#define BLAKE32_ROUNDS 8
+#endif
 
-static bool g_mining_mode = false;           /* Enable mining fast paths */
-static bool g_vulnerable_mode = true;        /* Reduced rounds ENABLED by default */
-static uint32_t g_vulnerable_rounds = 8;     /* Default 8 rounds (standard is 14) */
+/* Thread-local midstate so threads do not race */
+#if defined(_MSC_VER)
+  #define BLAKE_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+  #define BLAKE_TLS __thread
+#else
+  #define BLAKE_TLS
+#endif
 
-/* Bloom filter for nonce duplicate detection */
-#define BLOOM_SIZE 2048
-static uint32_t bloom_filter[BLOOM_SIZE];
-
-/* Simple nonce cache for recently seen nonces */
-#define NONCE_CACHE_SIZE 256
-static uint32_t nonce_cache[NONCE_CACHE_SIZE];
-static uint32_t nonce_cache_index = 0;
-
-/* Midstate cache for 32-bit BLAKE */
 typedef struct {
     uint32_t H[8];
     uint32_t S[4];
     uint32_t T0, T1;
-    size_t   processed_bytes;
-} blake_midstate32_t;
+    unsigned char buf[64];
+    size_t   ptr;
+    uint32_t header_prefix[19];   /* 76 bytes that produced this midstate */
+    bool     valid;
+} blake256_midstate_t;
 
-static blake_midstate32_t g_midstate32;
-static bool g_midstate_valid = false;
+static BLAKE_TLS blake256_midstate_t t_midstate;
 
-/* Context pool to avoid repeated allocations */
-#define BLAKE_CTX_POOL_SIZE 4
-static sph_blake256_context g_ctx_pool32[BLAKE_CTX_POOL_SIZE];
-static bool g_ctx_in_use32[BLAKE_CTX_POOL_SIZE] = {0};
-
-/* =================================================================== */
-/* EXACT HELPER FUNCTIONS                                              */
-/* =================================================================== */
-
-static inline uint32_t bloom_hash(const void *data, size_t len) {
-    const uint8_t *bytes = (const uint8_t*)data;
-    uint32_t hash = 5381;
-    for (size_t i = 0; i < len; i++)
-        hash = ((hash << 5) + hash) + bytes[i];
-    return hash;
-}
-
-static bool bloom_check_and_add(uint32_t nonce) {
-    uint32_t h = bloom_hash(&nonce, sizeof(nonce)) % BLOOM_SIZE;
-    if (bloom_filter[h])
-        return true;
-    bloom_filter[h] = 1;
-    return false;
-}
-
-static bool nonce_cache_contains(uint32_t nonce) {
-    for (int i = 0; i < NONCE_CACHE_SIZE; i++) {
-        if (nonce_cache[i] == nonce)
-            return true;
-    }
-    return false;
-}
-
-static void nonce_cache_add(uint32_t nonce) {
-    nonce_cache[nonce_cache_index] = nonce;
-    nonce_cache_index = (nonce_cache_index + 1) % NONCE_CACHE_SIZE;
-}
-
-static sph_blake256_context* blake32_ctx_alloc(void) {
-    for (int i = 0; i < BLAKE_CTX_POOL_SIZE; i++) {
-        if (!g_ctx_in_use32[i]) {
-            g_ctx_in_use32[i] = true;
-            return &g_ctx_pool32[i];
-        }
-    }
-    return NULL;
-}
-
-static void blake32_ctx_free(sph_blake256_context *ctx) {
-    for (int i = 0; i < BLAKE_CTX_POOL_SIZE; i++) {
-        if (&g_ctx_pool32[i] == ctx) {
-            g_ctx_in_use32[i] = false;
-            break;
-        }
-    }
-}
-
-/* =================================================================== */
-/* ORIGINAL SPH CONFIGURATION (unchanged)                              */
-/* =================================================================== */
-
+/* ------------------------------------------------------------------ */
+/*  Original sphlib BLAKE-256 constants / macros (unchanged)          */
+/* ------------------------------------------------------------------ */
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_BLAKE
 #define SPH_SMALL_FOOTPRINT_BLAKE   1
 #endif
@@ -159,52 +63,36 @@ static void blake32_ctx_free(sph_blake256_context *ctx) {
 #endif
 
 static const sph_u32 IV224[8] = {
-	SPH_C32(0xC1059ED8), SPH_C32(0x367CD507),
-	SPH_C32(0x3070DD17), SPH_C32(0xF70E5939),
-	SPH_C32(0xFFC00B31), SPH_C32(0x68581511),
-	SPH_C32(0x64F98FA7), SPH_C32(0xBEFA4FA4)
+    SPH_C32(0xC1059ED8), SPH_C32(0x367CD507),
+    SPH_C32(0x3070DD17), SPH_C32(0xF70E5939),
+    SPH_C32(0xFFC00B31), SPH_C32(0x68581511),
+    SPH_C32(0x64F98FA7), SPH_C32(0xBEFA4FA4)
 };
 
 static const sph_u32 IV256[8] = {
-	SPH_C32(0x6A09E667), SPH_C32(0xBB67AE85),
-	SPH_C32(0x3C6EF372), SPH_C32(0xA54FF53A),
-	SPH_C32(0x510E527F), SPH_C32(0x9B05688C),
-	SPH_C32(0x1F83D9AB), SPH_C32(0x5BE0CD19)
+    SPH_C32(0x6A09E667), SPH_C32(0xBB67AE85),
+    SPH_C32(0x3C6EF372), SPH_C32(0xA54FF53A),
+    SPH_C32(0x510E527F), SPH_C32(0x9B05688C),
+    SPH_C32(0x1F83D9AB), SPH_C32(0x5BE0CD19)
 };
-
-#if SPH_64
-static const sph_u64 IV384[8] = {
-	SPH_C64(0xCBBB9D5DC1059ED8), SPH_C64(0x629A292A367CD507),
-	SPH_C64(0x9159015A3070DD17), SPH_C64(0x152FECD8F70E5939),
-	SPH_C64(0x67332667FFC00B31), SPH_C64(0x8EB44A8768581511),
-	SPH_C64(0xDB0C2E0D64F98FA7), SPH_C64(0x47B5481DBEFA4FA4)
-};
-
-static const sph_u64 IV512[8] = {
-	SPH_C64(0x6A09E667F3BCC908), SPH_C64(0xBB67AE8584CAA73B),
-	SPH_C64(0x3C6EF372FE94F82B), SPH_C64(0xA54FF53A5F1D36F1),
-	SPH_C64(0x510E527FADE682D1), SPH_C64(0x9B05688C2B3E6C1F),
-	SPH_C64(0x1F83D9ABFB41BD6B), SPH_C64(0x5BE0CD19137E2179)
-};
-#endif
 
 static const unsigned sigma[16][16] = {
-	{  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
-	{ 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
-	{ 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
-	{  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
-	{  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
-	{  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 },
-	{ 12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11 },
-	{ 13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10 },
-	{  6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5 },
-	{ 10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0 },
-	{  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
-	{ 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
-	{ 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
-	{  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
-	{  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
-	{  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 }
+    {  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
+    { 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
+    { 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
+    {  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
+    {  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
+    {  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 },
+    { 12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11 },
+    { 13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10 },
+    {  6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5 },
+    { 10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0 },
+    {  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
+    { 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
+    { 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
+    {  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
+    {  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
+    {  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 }
 };
 
 #define Z00   0
@@ -404,510 +292,310 @@ static const unsigned sigma[16][16] = {
 
 #if SPH_COMPACT_BLAKE_32
 static const sph_u32 CS[16] = {
-	SPH_C32(0x243F6A88), SPH_C32(0x85A308D3),
-	SPH_C32(0x13198A2E), SPH_C32(0x03707344),
-	SPH_C32(0xA4093822), SPH_C32(0x299F31D0),
-	SPH_C32(0x082EFA98), SPH_C32(0xEC4E6C89),
-	SPH_C32(0x452821E6), SPH_C32(0x38D01377),
-	SPH_C32(0xBE5466CF), SPH_C32(0x34E90C6C),
-	SPH_C32(0xC0AC29B7), SPH_C32(0xC97C50DD),
-	SPH_C32(0x3F84D5B5), SPH_C32(0xB5470917)
+    SPH_C32(0x243F6A88), SPH_C32(0x85A308D3),
+    SPH_C32(0x13198A2E), SPH_C32(0x03707344),
+    SPH_C32(0xA4093822), SPH_C32(0x299F31D0),
+    SPH_C32(0x082EFA98), SPH_C32(0xEC4E6C89),
+    SPH_C32(0x452821E6), SPH_C32(0x38D01377),
+    SPH_C32(0xBE5466CF), SPH_C32(0x34E90C6C),
+    SPH_C32(0xC0AC29B7), SPH_C32(0xC97C50DD),
+    SPH_C32(0x3F84D5B5), SPH_C32(0xB5470917)
 };
-#endif
-
-#if SPH_64
-#define CBx(r, i)   CBx_(Z ## r ## i)
-#define CBx_(n)     CBx__(n)
-#define CBx__(n)    CB ## n
-
-#define CB0   SPH_C64(0x243F6A8885A308D3)
-#define CB1   SPH_C64(0x13198A2E03707344)
-#define CB2   SPH_C64(0xA4093822299F31D0)
-#define CB3   SPH_C64(0x082EFA98EC4E6C89)
-#define CB4   SPH_C64(0x452821E638D01377)
-#define CB5   SPH_C64(0xBE5466CF34E90C6C)
-#define CB6   SPH_C64(0xC0AC29B7C97C50DD)
-#define CB7   SPH_C64(0x3F84D5B5B5470917)
-#define CB8   SPH_C64(0x9216D5D98979FB1B)
-#define CB9   SPH_C64(0xD1310BA698DFB5AC)
-#define CBA   SPH_C64(0x2FFD72DBD01ADFB7)
-#define CBB   SPH_C64(0xB8E1AFED6A267E96)
-#define CBC   SPH_C64(0xBA7C9045F12C7F99)
-#define CBD   SPH_C64(0x24A19947B3916CF7)
-#define CBE   SPH_C64(0x0801F2E2858EFC16)
-#define CBF   SPH_C64(0x636920D871574E69)
-
-#if SPH_COMPACT_BLAKE_64
-static const sph_u64 CB[16] = {
-	SPH_C64(0x243F6A8885A308D3), SPH_C64(0x13198A2E03707344),
-	SPH_C64(0xA4093822299F31D0), SPH_C64(0x082EFA98EC4E6C89),
-	SPH_C64(0x452821E638D01377), SPH_C64(0xBE5466CF34E90C6C),
-	SPH_C64(0xC0AC29B7C97C50DD), SPH_C64(0x3F84D5B5B5470917),
-	SPH_C64(0x9216D5D98979FB1B), SPH_C64(0xD1310BA698DFB5AC),
-	SPH_C64(0x2FFD72DBD01ADFB7), SPH_C64(0xB8E1AFED6A267E96),
-	SPH_C64(0xBA7C9045F12C7F99), SPH_C64(0x24A19947B3916CF7),
-	SPH_C64(0x0801F2E2858EFC16), SPH_C64(0x636920D871574E69)
-};
-#endif
 #endif
 
 #define GS(m0, m1, c0, c1, a, b, c, d)   do { \
-		a = SPH_T32(a + b + (m0 ^ c1)); \
-		d = SPH_ROTR32(d ^ a, 16); \
-		c = SPH_T32(c + d); \
-		b = SPH_ROTR32(b ^ c, 12); \
-		a = SPH_T32(a + b + (m1 ^ c0)); \
-		d = SPH_ROTR32(d ^ a, 8); \
-		c = SPH_T32(c + d); \
-		b = SPH_ROTR32(b ^ c, 7); \
-	} while (0)
+        a = SPH_T32(a + b + (m0 ^ c1)); \
+        d = SPH_ROTR32(d ^ a, 16); \
+        c = SPH_T32(c + d); \
+        b = SPH_ROTR32(b ^ c, 12); \
+        a = SPH_T32(a + b + (m1 ^ c0)); \
+        d = SPH_ROTR32(d ^ a, 8); \
+        c = SPH_T32(c + d); \
+        b = SPH_ROTR32(b ^ c, 7); \
+    } while (0)
 
 #if SPH_COMPACT_BLAKE_32
 #define ROUND_S(r)   do { \
-		GS(M[sigma[r][0x0]], M[sigma[r][0x1]], \
-			CS[sigma[r][0x0]], CS[sigma[r][0x1]], V0, V4, V8, VC); \
-		GS(M[sigma[r][0x2]], M[sigma[r][0x3]], \
-			CS[sigma[r][0x2]], CS[sigma[r][0x3]], V1, V5, V9, VD); \
-		GS(M[sigma[r][0x4]], M[sigma[r][0x5]], \
-			CS[sigma[r][0x4]], CS[sigma[r][0x5]], V2, V6, VA, VE); \
-		GS(M[sigma[r][0x6]], M[sigma[r][0x7]], \
-			CS[sigma[r][0x6]], CS[sigma[r][0x7]], V3, V7, VB, VF); \
-		GS(M[sigma[r][0x8]], M[sigma[r][0x9]], \
-			CS[sigma[r][0x8]], CS[sigma[r][0x9]], V0, V5, VA, VF); \
-		GS(M[sigma[r][0xA]], M[sigma[r][0xB]], \
-			CS[sigma[r][0xA]], CS[sigma[r][0xB]], V1, V6, VB, VC); \
-		GS(M[sigma[r][0xC]], M[sigma[r][0xD]], \
-			CS[sigma[r][0xC]], CS[sigma[r][0xD]], V2, V7, V8, VD); \
-		GS(M[sigma[r][0xE]], M[sigma[r][0xF]], \
-			CS[sigma[r][0xE]], CS[sigma[r][0xF]], V3, V4, V9, VE); \
-	} while (0)
+        GS(M[sigma[r][0x0]], M[sigma[r][0x1]], \
+            CS[sigma[r][0x0]], CS[sigma[r][0x1]], V0, V4, V8, VC); \
+        GS(M[sigma[r][0x2]], M[sigma[r][0x3]], \
+            CS[sigma[r][0x2]], CS[sigma[r][0x3]], V1, V5, V9, VD); \
+        GS(M[sigma[r][0x4]], M[sigma[r][0x5]], \
+            CS[sigma[r][0x4]], CS[sigma[r][0x5]], V2, V6, VA, VE); \
+        GS(M[sigma[r][0x6]], M[sigma[r][0x7]], \
+            CS[sigma[r][0x6]], CS[sigma[r][0x7]], V3, V7, VB, VF); \
+        GS(M[sigma[r][0x8]], M[sigma[r][0x9]], \
+            CS[sigma[r][0x8]], CS[sigma[r][0x9]], V0, V5, VA, VF); \
+        GS(M[sigma[r][0xA]], M[sigma[r][0xB]], \
+            CS[sigma[r][0xA]], CS[sigma[r][0xB]], V1, V6, VB, VC); \
+        GS(M[sigma[r][0xC]], M[sigma[r][0xD]], \
+            CS[sigma[r][0xC]], CS[sigma[r][0xD]], V2, V7, V8, VD); \
+        GS(M[sigma[r][0xE]], M[sigma[r][0xF]], \
+            CS[sigma[r][0xE]], CS[sigma[r][0xF]], V3, V4, V9, VE); \
+    } while (0)
 #else
 #define ROUND_S(r)   do { \
-		GS(Mx(r, 0), Mx(r, 1), CSx(r, 0), CSx(r, 1), V0, V4, V8, VC); \
-		GS(Mx(r, 2), Mx(r, 3), CSx(r, 2), CSx(r, 3), V1, V5, V9, VD); \
-		GS(Mx(r, 4), Mx(r, 5), CSx(r, 4), CSx(r, 5), V2, V6, VA, VE); \
-		GS(Mx(r, 6), Mx(r, 7), CSx(r, 6), CSx(r, 7), V3, V7, VB, VF); \
-		GS(Mx(r, 8), Mx(r, 9), CSx(r, 8), CSx(r, 9), V0, V5, VA, VF); \
-		GS(Mx(r, A), Mx(r, B), CSx(r, A), CSx(r, B), V1, V6, VB, VC); \
-		GS(Mx(r, C), Mx(r, D), CSx(r, C), CSx(r, D), V2, V7, V8, VD); \
-		GS(Mx(r, E), Mx(r, F), CSx(r, E), CSx(r, F), V3, V4, V9, VE); \
-	} while (0)
-#endif
-
-#if SPH_64
-#define GB(m0, m1, c0, c1, a, b, c, d)   do { \
-		a = SPH_T64(a + b + (m0 ^ c1)); \
-		d = SPH_ROTR64(d ^ a, 32); \
-		c = SPH_T64(c + d); \
-		b = SPH_ROTR64(b ^ c, 25); \
-		a = SPH_T64(a + b + (m1 ^ c0)); \
-		d = SPH_ROTR64(d ^ a, 16); \
-		c = SPH_T64(c + d); \
-		b = SPH_ROTR64(b ^ c, 11); \
-	} while (0)
-
-#if SPH_COMPACT_BLAKE_64
-#define ROUND_B(r)   do { \
-		GB(M[sigma[r][0x0]], M[sigma[r][0x1]], \
-			CB[sigma[r][0x0]], CB[sigma[r][0x1]], V0, V4, V8, VC); \
-		GB(M[sigma[r][0x2]], M[sigma[r][0x3]], \
-			CB[sigma[r][0x2]], CB[sigma[r][0x3]], V1, V5, V9, VD); \
-		GB(M[sigma[r][0x4]], M[sigma[r][0x5]], \
-			CB[sigma[r][0x4]], CB[sigma[r][0x5]], V2, V6, VA, VE); \
-		GB(M[sigma[r][0x6]], M[sigma[r][0x7]], \
-			CB[sigma[r][0x6]], CB[sigma[r][0x7]], V3, V7, VB, VF); \
-		GB(M[sigma[r][0x8]], M[sigma[r][0x9]], \
-			CB[sigma[r][0x8]], CB[sigma[r][0x9]], V0, V5, VA, VF); \
-		GB(M[sigma[r][0xA]], M[sigma[r][0xB]], \
-			CB[sigma[r][0xA]], CB[sigma[r][0xB]], V1, V6, VB, VC); \
-		GB(M[sigma[r][0xC]], M[sigma[r][0xD]], \
-			CB[sigma[r][0xC]], CB[sigma[r][0xD]], V2, V7, V8, VD); \
-		GB(M[sigma[r][0xE]], M[sigma[r][0xF]], \
-			CB[sigma[r][0xE]], CB[sigma[r][0xF]], V3, V4, V9, VE); \
-	} while (0)
-#else
-#define ROUND_B(r)   do { \
-		GB(Mx(r, 0), Mx(r, 1), CBx(r, 0), CBx(r, 1), V0, V4, V8, VC); \
-		GB(Mx(r, 2), Mx(r, 3), CBx(r, 2), CBx(r, 3), V1, V5, V9, VD); \
-		GB(Mx(r, 4), Mx(r, 5), CBx(r, 4), CBx(r, 5), V2, V6, VA, VE); \
-		GB(Mx(r, 6), Mx(r, 7), CBx(r, 6), CBx(r, 7), V3, V7, VB, VF); \
-		GB(Mx(r, 8), Mx(r, 9), CBx(r, 8), CBx(r, 9), V0, V5, VA, VF); \
-		GB(Mx(r, A), Mx(r, B), CBx(r, A), CBx(r, B), V1, V6, VB, VC); \
-		GB(Mx(r, C), Mx(r, D), CBx(r, C), CBx(r, D), V2, V7, V8, VD); \
-		GB(Mx(r, E), Mx(r, F), CBx(r, E), CBx(r, F), V3, V4, V9, VE); \
-	} while (0)
-#endif
+        GS(Mx(r, 0), Mx(r, 1), CSx(r, 0), CSx(r, 1), V0, V4, V8, VC); \
+        GS(Mx(r, 2), Mx(r, 3), CSx(r, 2), CSx(r, 3), V1, V5, V9, VD); \
+        GS(Mx(r, 4), Mx(r, 5), CSx(r, 4), CSx(r, 5), V2, V6, VA, VE); \
+        GS(Mx(r, 6), Mx(r, 7), CSx(r, 6), CSx(r, 7), V3, V7, VB, VF); \
+        GS(Mx(r, 8), Mx(r, 9), CSx(r, 8), CSx(r, 9), V0, V5, VA, VF); \
+        GS(Mx(r, A), Mx(r, B), CSx(r, A), CSx(r, B), V1, V6, VB, VC); \
+        GS(Mx(r, C), Mx(r, D), CSx(r, C), CSx(r, D), V2, V7, V8, VD); \
+        GS(Mx(r, E), Mx(r, F), CSx(r, E), CSx(r, F), V3, V4, V9, VE); \
+    } while (0)
 #endif
 
 #define DECL_STATE32 \
-	sph_u32 H0, H1, H2, H3, H4, H5, H6, H7; \
-	sph_u32 S0, S1, S2, S3, T0, T1;
+    sph_u32 H0, H1, H2, H3, H4, H5, H6, H7; \
+    sph_u32 S0, S1, S2, S3, T0, T1;
 
 #define READ_STATE32(state)   do { \
-		H0 = (state)->H[0]; \
-		H1 = (state)->H[1]; \
-		H2 = (state)->H[2]; \
-		H3 = (state)->H[3]; \
-		H4 = (state)->H[4]; \
-		H5 = (state)->H[5]; \
-		H6 = (state)->H[6]; \
-		H7 = (state)->H[7]; \
-		S0 = (state)->S[0]; \
-		S1 = (state)->S[1]; \
-		S2 = (state)->S[2]; \
-		S3 = (state)->S[3]; \
-		T0 = (state)->T0; \
-		T1 = (state)->T1; \
-	} while (0)
+        H0 = (state)->H[0]; \
+        H1 = (state)->H[1]; \
+        H2 = (state)->H[2]; \
+        H3 = (state)->H[3]; \
+        H4 = (state)->H[4]; \
+        H5 = (state)->H[5]; \
+        H6 = (state)->H[6]; \
+        H7 = (state)->H[7]; \
+        S0 = (state)->S[0]; \
+        S1 = (state)->S[1]; \
+        S2 = (state)->S[2]; \
+        S3 = (state)->S[3]; \
+        T0 = (state)->T0; \
+        T1 = (state)->T1; \
+    } while (0)
 
 #define WRITE_STATE32(state)   do { \
-		(state)->H[0] = H0; \
-		(state)->H[1] = H1; \
-		(state)->H[2] = H2; \
-		(state)->H[3] = H3; \
-		(state)->H[4] = H4; \
-		(state)->H[5] = H5; \
-		(state)->H[6] = H6; \
-		(state)->H[7] = H7; \
-		(state)->S[0] = S0; \
-		(state)->S[1] = S1; \
-		(state)->S[2] = S2; \
-		(state)->S[3] = S3; \
-		(state)->T0 = T0; \
-		(state)->T1 = T1; \
-	} while (0)
-
-#ifndef BLAKE32_ROUNDS
-#define BLAKE32_ROUNDS 14
-#endif
-
-/* =================================================================== */
-/* COMPRESSION MACROS (supports reduced rounds)                        */
-/* =================================================================== */
+        (state)->H[0] = H0; \
+        (state)->H[1] = H1; \
+        (state)->H[2] = H2; \
+        (state)->H[3] = H3; \
+        (state)->H[4] = H4; \
+        (state)->H[5] = H5; \
+        (state)->H[6] = H6; \
+        (state)->H[7] = H7; \
+        (state)->S[0] = S0; \
+        (state)->S[1] = S1; \
+        (state)->S[2] = S2; \
+        (state)->S[3] = S3; \
+        (state)->T0 = T0; \
+        (state)->T1 = T1; \
+    } while (0)
 
 #if SPH_COMPACT_BLAKE_32
 #define COMPRESS32   do { \
-		sph_u32 M[16]; \
-		sph_u32 V0, V1, V2, V3, V4, V5, V6, V7; \
-		sph_u32 V8, V9, VA, VB, VC, VD, VE, VF; \
-		unsigned r; \
-		V0 = H0; \
-		V1 = H1; \
-		V2 = H2; \
-		V3 = H3; \
-		V4 = H4; \
-		V5 = H5; \
-		V6 = H6; \
-		V7 = H7; \
-		V8 = S0 ^ CS0; \
-		V9 = S1 ^ CS1; \
-		VA = S2 ^ CS2; \
-		VB = S3 ^ CS3; \
-		VC = T0 ^ CS4; \
-		VD = T0 ^ CS5; \
-		VE = T1 ^ CS6; \
-		VF = T1 ^ CS7; \
-		M[0x0] = sph_dec32be_aligned(buf +  0); \
-		M[0x1] = sph_dec32be_aligned(buf +  4); \
-		M[0x2] = sph_dec32be_aligned(buf +  8); \
-		M[0x3] = sph_dec32be_aligned(buf + 12); \
-		M[0x4] = sph_dec32be_aligned(buf + 16); \
-		M[0x5] = sph_dec32be_aligned(buf + 20); \
-		M[0x6] = sph_dec32be_aligned(buf + 24); \
-		M[0x7] = sph_dec32be_aligned(buf + 28); \
-		M[0x8] = sph_dec32be_aligned(buf + 32); \
-		M[0x9] = sph_dec32be_aligned(buf + 36); \
-		M[0xA] = sph_dec32be_aligned(buf + 40); \
-		M[0xB] = sph_dec32be_aligned(buf + 44); \
-		M[0xC] = sph_dec32be_aligned(buf + 48); \
-		M[0xD] = sph_dec32be_aligned(buf + 52); \
-		M[0xE] = sph_dec32be_aligned(buf + 56); \
-		M[0xF] = sph_dec32be_aligned(buf + 60); \
-		unsigned rounds = g_vulnerable_mode ? g_vulnerable_rounds : BLAKE32_ROUNDS; \
-		for (r = 0; r < rounds; r ++) \
-			ROUND_S(r); \
-		H0 ^= S0 ^ V0 ^ V8; \
-		H1 ^= S1 ^ V1 ^ V9; \
-		H2 ^= S2 ^ V2 ^ VA; \
-		H3 ^= S3 ^ V3 ^ VB; \
-		H4 ^= S0 ^ V4 ^ VC; \
-		H5 ^= S1 ^ V5 ^ VD; \
-		H6 ^= S2 ^ V6 ^ VE; \
-		H7 ^= S3 ^ V7 ^ VF; \
-	} while (0)
+        sph_u32 M[16]; \
+        sph_u32 V0, V1, V2, V3, V4, V5, V6, V7; \
+        sph_u32 V8, V9, VA, VB, VC, VD, VE, VF; \
+        unsigned r; \
+        V0 = H0; \
+        V1 = H1; \
+        V2 = H2; \
+        V3 = H3; \
+        V4 = H4; \
+        V5 = H5; \
+        V6 = H6; \
+        V7 = H7; \
+        V8 = S0 ^ CS0; \
+        V9 = S1 ^ CS1; \
+        VA = S2 ^ CS2; \
+        VB = S3 ^ CS3; \
+        VC = T0 ^ CS4; \
+        VD = T0 ^ CS5; \
+        VE = T1 ^ CS6; \
+        VF = T1 ^ CS7; \
+        M[0x0] = sph_dec32be_aligned(buf +  0); \
+        M[0x1] = sph_dec32be_aligned(buf +  4); \
+        M[0x2] = sph_dec32be_aligned(buf +  8); \
+        M[0x3] = sph_dec32be_aligned(buf + 12); \
+        M[0x4] = sph_dec32be_aligned(buf + 16); \
+        M[0x5] = sph_dec32be_aligned(buf + 20); \
+        M[0x6] = sph_dec32be_aligned(buf + 24); \
+        M[0x7] = sph_dec32be_aligned(buf + 28); \
+        M[0x8] = sph_dec32be_aligned(buf + 32); \
+        M[0x9] = sph_dec32be_aligned(buf + 36); \
+        M[0xA] = sph_dec32be_aligned(buf + 40); \
+        M[0xB] = sph_dec32be_aligned(buf + 44); \
+        M[0xC] = sph_dec32be_aligned(buf + 48); \
+        M[0xD] = sph_dec32be_aligned(buf + 52); \
+        M[0xE] = sph_dec32be_aligned(buf + 56); \
+        M[0xF] = sph_dec32be_aligned(buf + 60); \
+        for (r = 0; r < BLAKE32_ROUNDS; r ++) \
+            ROUND_S(r); \
+        H0 ^= S0 ^ V0 ^ V8; \
+        H1 ^= S1 ^ V1 ^ V9; \
+        H2 ^= S2 ^ V2 ^ VA; \
+        H3 ^= S3 ^ V3 ^ VB; \
+        H4 ^= S0 ^ V4 ^ VC; \
+        H5 ^= S1 ^ V5 ^ VD; \
+        H6 ^= S2 ^ V6 ^ VE; \
+        H7 ^= S3 ^ V7 ^ VF; \
+    } while (0)
 #else
 #define COMPRESS32   do { \
-		sph_u32 M0, M1, M2, M3, M4, M5, M6, M7; \
-		sph_u32 M8, M9, MA, MB, MC, MD, ME, MF; \
-		sph_u32 V0, V1, V2, V3, V4, V5, V6, V7; \
-		sph_u32 V8, V9, VA, VB, VC, VD, VE, VF; \
-		V0 = H0; \
-		V1 = H1; \
-		V2 = H2; \
-		V3 = H3; \
-		V4 = H4; \
-		V5 = H5; \
-		V6 = H6; \
-		V7 = H7; \
-		V8 = S0 ^ CS0; \
-		V9 = S1 ^ CS1; \
-		VA = S2 ^ CS2; \
-		VB = S3 ^ CS3; \
-		VC = T0 ^ CS4; \
-		VD = T0 ^ CS5; \
-		VE = T1 ^ CS6; \
-		VF = T1 ^ CS7; \
-		M0 = sph_dec32be_aligned(buf +  0); \
-		M1 = sph_dec32be_aligned(buf +  4); \
-		M2 = sph_dec32be_aligned(buf +  8); \
-		M3 = sph_dec32be_aligned(buf + 12); \
-		M4 = sph_dec32be_aligned(buf + 16); \
-		M5 = sph_dec32be_aligned(buf + 20); \
-		M6 = sph_dec32be_aligned(buf + 24); \
-		M7 = sph_dec32be_aligned(buf + 28); \
-		M8 = sph_dec32be_aligned(buf + 32); \
-		M9 = sph_dec32be_aligned(buf + 36); \
-		MA = sph_dec32be_aligned(buf + 40); \
-		MB = sph_dec32be_aligned(buf + 44); \
-		MC = sph_dec32be_aligned(buf + 48); \
-		MD = sph_dec32be_aligned(buf + 52); \
-		ME = sph_dec32be_aligned(buf + 56); \
-		MF = sph_dec32be_aligned(buf + 60); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 1) ROUND_S(0); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 2) ROUND_S(1); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 3) ROUND_S(2); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 4) ROUND_S(3); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 5) ROUND_S(4); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 6) ROUND_S(5); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 7) ROUND_S(6); \
-		if (!g_vulnerable_mode || g_vulnerable_rounds >= 8) ROUND_S(7); \
-		if (!g_vulnerable_mode) { \
-			ROUND_S(8); \
-			ROUND_S(9); \
-			ROUND_S(0); \
-			ROUND_S(1); \
-			ROUND_S(2); \
-			ROUND_S(3); \
-		} else { \
-			if (g_vulnerable_rounds >= 9)  ROUND_S(8); \
-			if (g_vulnerable_rounds >= 10) ROUND_S(9); \
-			if (g_vulnerable_rounds >= 11) ROUND_S(0); \
-			if (g_vulnerable_rounds >= 12) ROUND_S(1); \
-			if (g_vulnerable_rounds >= 13) ROUND_S(2); \
-			if (g_vulnerable_rounds >= 14) ROUND_S(3); \
-		} \
-		H0 ^= S0 ^ V0 ^ V8; \
-		H1 ^= S1 ^ V1 ^ V9; \
-		H2 ^= S2 ^ V2 ^ VA; \
-		H3 ^= S3 ^ V3 ^ VB; \
-		H4 ^= S0 ^ V4 ^ VC; \
-		H5 ^= S1 ^ V5 ^ VD; \
-		H6 ^= S2 ^ V6 ^ VE; \
-		H7 ^= S3 ^ V7 ^ VF; \
-	} while (0)
+        sph_u32 M0, M1, M2, M3, M4, M5, M6, M7; \
+        sph_u32 M8, M9, MA, MB, MC, MD, ME, MF; \
+        sph_u32 V0, V1, V2, V3, V4, V5, V6, V7; \
+        sph_u32 V8, V9, VA, VB, VC, VD, VE, VF; \
+        V0 = H0; \
+        V1 = H1; \
+        V2 = H2; \
+        V3 = H3; \
+        V4 = H4; \
+        V5 = H5; \
+        V6 = H6; \
+        V7 = H7; \
+        V8 = S0 ^ CS0; \
+        V9 = S1 ^ CS1; \
+        VA = S2 ^ CS2; \
+        VB = S3 ^ CS3; \
+        VC = T0 ^ CS4; \
+        VD = T0 ^ CS5; \
+        VE = T1 ^ CS6; \
+        VF = T1 ^ CS7; \
+        M0 = sph_dec32be_aligned(buf +  0); \
+        M1 = sph_dec32be_aligned(buf +  4); \
+        M2 = sph_dec32be_aligned(buf +  8); \
+        M3 = sph_dec32be_aligned(buf + 12); \
+        M4 = sph_dec32be_aligned(buf + 16); \
+        M5 = sph_dec32be_aligned(buf + 20); \
+        M6 = sph_dec32be_aligned(buf + 24); \
+        M7 = sph_dec32be_aligned(buf + 28); \
+        M8 = sph_dec32be_aligned(buf + 32); \
+        M9 = sph_dec32be_aligned(buf + 36); \
+        MA = sph_dec32be_aligned(buf + 40); \
+        MB = sph_dec32be_aligned(buf + 44); \
+        MC = sph_dec32be_aligned(buf + 48); \
+        MD = sph_dec32be_aligned(buf + 52); \
+        ME = sph_dec32be_aligned(buf + 56); \
+        MF = sph_dec32be_aligned(buf + 60); \
+        ROUND_S(0); \
+        ROUND_S(1); \
+        ROUND_S(2); \
+        ROUND_S(3); \
+        ROUND_S(4); \
+        ROUND_S(5); \
+        ROUND_S(6); \
+        ROUND_S(7); \
+        H0 ^= S0 ^ V0 ^ V8; \
+        H1 ^= S1 ^ V1 ^ V9; \
+        H2 ^= S2 ^ V2 ^ VA; \
+        H3 ^= S3 ^ V3 ^ VB; \
+        H4 ^= S0 ^ V4 ^ VC; \
+        H5 ^= S1 ^ V5 ^ VD; \
+        H6 ^= S2 ^ V6 ^ VE; \
+        H7 ^= S3 ^ V7 ^ VF; \
+    } while (0)
 #endif
-
-/* =================================================================== */
-/* ORIGINAL API FUNCTIONS (with exact optimizations where safe)        */
-/* =================================================================== */
 
 static const sph_u32 salt_zero_small[4] = { 0, 0, 0, 0 };
 
 static void
 blake32_init(sph_blake_small_context *sc,
-	const sph_u32 *iv, const sph_u32 *salt)
+    const sph_u32 *iv, const sph_u32 *salt)
 {
-	memcpy(sc->H, iv, 8 * sizeof(sph_u32));
-	memcpy(sc->S, salt, 4 * sizeof(sph_u32));
-	sc->T0 = sc->T1 = 0;
-	sc->ptr = 0;
+    memcpy(sc->H, iv, 8 * sizeof(sph_u32));
+    memcpy(sc->S, salt, 4 * sizeof(sph_u32));
+    sc->T0 = sc->T1 = 0;
+    sc->ptr = 0;
 }
 
 static void
 blake32(sph_blake_small_context *sc, const void *data, size_t len)
 {
-	unsigned char *buf;
-	size_t ptr;
-	DECL_STATE32
+    unsigned char *buf;
+    size_t ptr;
+    DECL_STATE32
 
-	buf = sc->buf;
-	ptr = sc->ptr;
-	if (len < (sizeof sc->buf) - ptr) {
-		memcpy(buf + ptr, data, len);
-		ptr += len;
-		sc->ptr = ptr;
-		return;
-	}
+    buf = sc->buf;
+    ptr = sc->ptr;
+    if (len < (sizeof sc->buf) - ptr) {
+        memcpy(buf + ptr, data, len);
+        ptr += len;
+        sc->ptr = ptr;
+        return;
+    }
 
-	READ_STATE32(sc);
-	while (len > 0) {
-		size_t clen;
+    READ_STATE32(sc);
+    while (len > 0) {
+        size_t clen;
 
-		clen = (sizeof sc->buf) - ptr;
-		if (clen > len)
-			clen = len;
-		memcpy(buf + ptr, data, clen);
-		ptr += clen;
-		data = (const unsigned char *)data + clen;
-		len -= clen;
-		if (ptr == sizeof sc->buf) {
-			if ((T0 = SPH_T32(T0 + 512)) < 512)
-				T1 = SPH_T32(T1 + 1);
-			COMPRESS32;
-			ptr = 0;
-		}
-	}
-	WRITE_STATE32(sc);
-	sc->ptr = ptr;
+        clen = (sizeof sc->buf) - ptr;
+        if (clen > len)
+            clen = len;
+        memcpy(buf + ptr, data, clen);
+        ptr += clen;
+        data = (const unsigned char *)data + clen;
+        len -= clen;
+        if (ptr == sizeof sc->buf) {
+            if ((T0 = SPH_T32(T0 + 512)) < 512)
+                T1 = SPH_T32(T1 + 1);
+            COMPRESS32;
+            ptr = 0;
+        }
+    }
+    WRITE_STATE32(sc);
+    sc->ptr = ptr;
 }
 
 static void
 blake32_close(sph_blake_small_context *sc,
-	unsigned ub, unsigned n, void *dst, size_t out_size_w32)
+    unsigned ub, unsigned n, void *dst, size_t out_size_w32)
 {
-	union {
-		unsigned char buf[64];
-		sph_u32 dummy;
-	} u;
-	size_t ptr, k;
-	unsigned bit_len;
-	unsigned z;
-	sph_u32 th, tl;
-	unsigned char *out;
+    union {
+        unsigned char buf[64];
+        sph_u32 dummy;
+    } u;
+    size_t ptr, k;
+    unsigned bit_len;
+    unsigned z;
+    sph_u32 th, tl;
+    unsigned char *out;
 
-	ptr = sc->ptr;
-	bit_len = ((unsigned)ptr << 3) + n;
-	z = 0x80 >> n;
-	u.buf[ptr] = ((ub & -z) | z) & 0xFF;
-	tl = sc->T0 + bit_len;
-	th = sc->T1;
-	if (ptr == 0 && n == 0) {
-		sc->T0 = SPH_C32(0xFFFFFE00);
-		sc->T1 = SPH_C32(0xFFFFFFFF);
-	} else if (sc->T0 == 0) {
-		sc->T0 = SPH_C32(0xFFFFFE00) + bit_len;
-		sc->T1 = SPH_T32(sc->T1 - 1);
-	} else {
-		sc->T0 -= 512 - bit_len;
-	}
-	if (bit_len <= 446) {
-		memset(u.buf + ptr + 1, 0, 55 - ptr);
-		if (out_size_w32 == 8)
-			u.buf[55] |= 1;
-		sph_enc32be_aligned(u.buf + 56, th);
-		sph_enc32be_aligned(u.buf + 60, tl);
-		blake32(sc, u.buf + ptr, 64 - ptr);
-	} else {
-		memset(u.buf + ptr + 1, 0, 63 - ptr);
-		blake32(sc, u.buf + ptr, 64 - ptr);
-		sc->T0 = SPH_C32(0xFFFFFE00);
-		sc->T1 = SPH_C32(0xFFFFFFFF);
-		memset(u.buf, 0, 56);
-		if (out_size_w32 == 8)
-			u.buf[55] = 1;
-		sph_enc32be_aligned(u.buf + 56, th);
-		sph_enc32be_aligned(u.buf + 60, tl);
-		blake32(sc, u.buf, 64);
-	}
-	out = dst;
-	for (k = 0; k < out_size_w32; k ++)
-		sph_enc32be(out + (k << 2), sc->H[k]);
-}
-
-/* =================================================================== */
-/* MINING OPTIMIZATIONS (EXACT)                                        */
-/* =================================================================== */
-
-void sph_blake256_precompute_midstate(const void *prefix, size_t len) {
-    sph_blake256_context ctx;
-    sph_blake256_init(&ctx);
-    sph_blake256(&ctx, prefix, len);
-    memcpy(g_midstate32.H, ctx.H, sizeof(ctx.H));
-    memcpy(g_midstate32.S, ctx.S, sizeof(ctx.S));
-    g_midstate32.T0 = ctx.T0;
-    g_midstate32.T1 = ctx.T1;
-    g_midstate32.processed_bytes = len;
-    g_midstate_valid = true;
-}
-
-void sph_blake256_from_midstate(const void *suffix, size_t suffix_len, void *dst) {
-    sph_blake256_context ctx;
-    if (!g_midstate_valid) {
-        sph_blake256_init(&ctx);
-        sph_blake256(&ctx, suffix, suffix_len);
-        sph_blake256_close(&ctx, dst);
-        return;
+    ptr = sc->ptr;
+    bit_len = ((unsigned)ptr << 3) + n;
+    z = 0x80 >> n;
+    u.buf[ptr] = ((ub & -z) | z) & 0xFF;
+    tl = sc->T0 + bit_len;
+    th = sc->T1;
+    if (ptr == 0 && n == 0) {
+        sc->T0 = SPH_C32(0xFFFFFE00);
+        sc->T1 = SPH_C32(0xFFFFFFFF);
+    } else if (sc->T0 == 0) {
+        sc->T0 = SPH_C32(0xFFFFFE00) + bit_len;
+        sc->T1 = SPH_T32(sc->T1 - 1);
+    } else {
+        sc->T0 -= 512 - bit_len;
     }
-    memcpy(ctx.H, g_midstate32.H, sizeof(ctx.H));
-    memcpy(ctx.S, g_midstate32.S, sizeof(ctx.S));
-    ctx.T0 = g_midstate32.T0;
-    ctx.T1 = g_midstate32.T1;
-    ctx.ptr = 0;
-    sph_blake256(&ctx, suffix, suffix_len);
-    sph_blake256_close(&ctx, dst);
+    if (bit_len <= 446) {
+        memset(u.buf + ptr + 1, 0, 55 - ptr);
+        if (out_size_w32 == 8)
+            u.buf[55] |= 1;
+        sph_enc32be_aligned(u.buf + 56, th);
+        sph_enc32be_aligned(u.buf + 60, tl);
+        blake32(sc, u.buf + ptr, 64 - ptr);
+    } else {
+        memset(u.buf + ptr + 1, 0, 63 - ptr);
+        blake32(sc, u.buf + ptr, 64 - ptr);
+        sc->T0 = SPH_C32(0xFFFFFE00);
+        sc->T1 = SPH_C32(0xFFFFFFFF);
+        memset(u.buf, 0, 56);
+        if (out_size_w32 == 8)
+            u.buf[55] = 1;
+        sph_enc32be_aligned(u.buf + 56, th);
+        sph_enc32be_aligned(u.buf + 60, tl);
+        blake32(sc, u.buf, 64);
+    }
+    out = dst;
+    for (k = 0; k < out_size_w32; k ++)
+        sph_enc32be(out + (k << 2), sc->H[k]);
 }
 
-int scanhash_blake256(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
-                      uint32_t max_nonce, unsigned long *hashes_done)
-{
-    uint32_t n = pdata[19] - 1;
-    const uint32_t first_nonce = pdata[19];
-    const uint32_t target = ptarget[7];
-    unsigned char hash[32];
-    int64_t count = 0;
-
-    /* Enable mining mode (vulnerable mode is already ON by default) */
-    g_mining_mode = true;
-
-    /* Precompute midstate from first 76 bytes (typical header) */
-    if (!g_midstate_valid) {
-        sph_blake256_precompute_midstate(pdata, 76);
-    }
-
-    sph_blake256_context *ctx = blake32_ctx_alloc();
-    if (!ctx) {
-        *hashes_done = 0;
-        return 0;
-    }
-
-    do {
-        pdata[19] = n;
-
-        if (bloom_check_and_add(n) || nonce_cache_contains(n)) {
-            count++;
-            continue;
-        }
-        nonce_cache_add(n);
-
-        /* Restore midstate */
-        memcpy(ctx->H, g_midstate32.H, sizeof(ctx->H));
-        memcpy(ctx->S, g_midstate32.S, sizeof(ctx->S));
-        ctx->T0 = g_midstate32.T0;
-        ctx->T1 = g_midstate32.T1;
-        ctx->ptr = 0;
-
-        const unsigned char *tail = (const unsigned char*)(pdata) + 76;
-        sph_blake256(ctx, tail, 4);
-        sph_blake256_close(ctx, hash);
-
-        if (*(uint32_t*)&hash[28] <= target) {
-            *hashes_done = count;
-            blake32_ctx_free(ctx);
-            return n - first_nonce + 1;
-        }
-        count++;
-
-    } while (n++ < max_nonce && !work_restart[thr_id].restart);
-
-    *hashes_done = count;
-    blake32_ctx_free(ctx);
-    return 0;
-}
-
-/* =================================================================== */
-/* PUBLIC API (standard)                                               */
-/* =================================================================== */
-
+/* ------------------------------------------------------------------ */
+/*  Public API                                                        */
+/* ------------------------------------------------------------------ */
 void sph_blake224_init(void *cc) { blake32_init(cc, IV224, salt_zero_small); }
 void sph_blake224(void *cc, const void *data, size_t len) { blake32(cc, data, len); }
 void sph_blake224_close(void *cc, void *dst) { sph_blake224_addbits_and_close(cc, 0, 0, dst); }
@@ -924,33 +612,67 @@ void sph_blake256_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst
     sph_blake256_init(cc);
 }
 
-#if SPH_64
-/* 64-bit versions omitted for brevity */
-#endif
-
-/* =================================================================== */
-/* VULNERABLE MODE CONTROL (default ON)                                */
-/* =================================================================== */
-
-void sph_blake256_set_vulnerable_mode(bool enable, uint32_t rounds) {
-    g_vulnerable_mode = enable;
-    if (enable) {
-        if (rounds == 0) rounds = 8;
-        if (rounds > 14) rounds = 14;
-        g_vulnerable_rounds = rounds;
-    } else {
-        g_vulnerable_rounds = 14;
-    }
+/* ------------------------------------------------------------------ */
+/*  Midstate helpers (fixed)                                          */
+/* ------------------------------------------------------------------ */
+void sph_blake256_precompute_midstate(const void *prefix, size_t len,
+                                      blake256_midstate_t *ms)
+{
+    sph_blake256_context ctx;
+    sph_blake256_init(&ctx);
+    sph_blake256(&ctx, prefix, len);
+    memcpy(ms->H, ctx.H, sizeof(ms->H));
+    memcpy(ms->S, ctx.S, sizeof(ms->S));
+    ms->T0 = ctx.T0;
+    ms->T1 = ctx.T1;
+    memcpy(ms->buf, ctx.buf, sizeof(ms->buf));
+    ms->ptr  = ctx.ptr;
+    ms->valid = true;
 }
 
-void sph_blake256_reset_mining_state(void) {
-    g_midstate_valid = false;
-    g_mining_mode = false;
-    memset(bloom_filter, 0, sizeof(bloom_filter));
-    memset(nonce_cache, 0, sizeof(nonce_cache));
-    nonce_cache_index = 0;
-    for (int i = 0; i < BLAKE_CTX_POOL_SIZE; i++)
-        g_ctx_in_use32[i] = false;
+/* ------------------------------------------------------------------ */
+/*  Miner scanhash (thread-safe, correct midstate)                    */
+/* ------------------------------------------------------------------ */
+int scanhash_blake256(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
+                      uint32_t max_nonce, unsigned long *hashes_done)
+{
+    uint32_t n = pdata[19];
+    const uint32_t first_nonce = pdata[19];
+    const uint32_t target = ptarget[7];
+    unsigned char hash[32];
+    uint32_t count = 0;
+    sph_blake256_context ctx;
+    blake256_midstate_t *ms = &t_midstate;
+
+    /* Recompute midstate only when work changes */
+    if (!ms->valid || memcmp(ms->header_prefix, pdata, 76) != 0) {
+        memcpy(ms->header_prefix, pdata, 76);
+        sph_blake256_precompute_midstate(pdata, 76, ms);
+    }
+
+    do {
+        pdata[19] = n;
+
+        /* Restore full midstate INCLUDING partial block buffer */
+        memcpy(ctx.H, ms->H, sizeof(ctx.H));
+        memcpy(ctx.S, ms->S, sizeof(ctx.S));
+        ctx.T0 = ms->T0;
+        ctx.T1 = ms->T1;
+        memcpy(ctx.buf, ms->buf, sizeof(ctx.buf));
+        ctx.ptr = ms->ptr;
+
+        sph_blake256(&ctx, (const unsigned char*)pdata + 76, 4);
+        sph_blake256_close(&ctx, hash);
+
+        if (*(uint32_t*)&hash[28] <= target) {
+            *hashes_done = count;
+            return (int)(n - first_nonce + 1);
+        }
+        count++;
+    } while (n++ < max_nonce && !work_restart[thr_id].restart);
+
+    *hashes_done = count;
+    return 0;
 }
 
 #ifdef __cplusplus
