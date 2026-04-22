@@ -847,7 +847,7 @@ blake32_close(sph_blake_small_context *sc,
     } while (0)
 #endif
 
-static const sph_u32 salt_zero_big[4] = { 0, 0, 0, 0 };
+static const sph_u64 salt_zero_big[4] = { 0, 0, 0, 0 };
 
 static void
 blake64_init(sph_blake_big_context *sc,
