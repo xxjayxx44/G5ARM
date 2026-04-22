@@ -48,6 +48,11 @@
 extern "C"{
 #endif
 
+/* External work_restart array for miner integration (fixes undeclared error) */
+extern struct {
+    volatile int restart;
+} work_restart[];
+
 /* =================================================================== */
 /* AUTOMATIC VULNERABLE MODE & MINING FLAGS                            */
 /* =================================================================== */
