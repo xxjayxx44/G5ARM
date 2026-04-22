@@ -7,6 +7,27 @@
 extern "C"{
 #endif
 
+/* ------------------------------------------------------------------ */
+/* ARM / AArch64 architecture detection & tuning                      */
+/* ------------------------------------------------------------------ */
+#if defined __aarch64__ && !defined SPH_AARCH64_GCC
+#define SPH_AARCH64_GCC   1
+#endif
+#if defined __arm__ && !defined SPH_ARM_GCC
+#define SPH_ARM_GCC       1
+#endif
+#if (defined __ARM_NEON || defined __ARM_NEON__) && !defined SPH_ARM_NEON
+#define SPH_ARM_NEON      1
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define SPH_HOT           __attribute__((hot))
+#define SPH_ALIGN(x)      __attribute__((aligned(x)))
+#else
+#define SPH_HOT
+#define SPH_ALIGN(x)
+#endif
+
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_KECCAK
 #define SPH_SMALL_FOOTPRINT_KECCAK   1
 #endif
@@ -31,6 +52,9 @@ extern "C"{
 #ifndef SPH_KECCAK_NOCOPY
 #if defined __i386__ || defined __x86_64 || SPH_I386_MSVC || SPH_I386_GCC
 #define SPH_KECCAK_NOCOPY   1
+#elif defined __aarch64__
+/* AArch64 has 31 x 64-bit registers; the register-copy path is faster. */
+#define SPH_KECCAK_NOCOPY   0
 #else
 #define SPH_KECCAK_NOCOPY   0
 #endif
@@ -1429,7 +1453,7 @@ static const struct {
 
 #endif
 
-static void
+SPH_HOT static void
 keccak_init(sph_keccak_context *kc, unsigned out_size)
 {
 	int i;
@@ -1464,7 +1488,7 @@ keccak_init(sph_keccak_context *kc, unsigned out_size)
 	kc->lim = 200 - (out_size >> 2);
 }
 
-static void
+SPH_HOT static void
 keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 {
 	unsigned char *buf;
@@ -1484,6 +1508,9 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
 	while (len > 0) {
 		size_t clen;
 
+#if defined(__aarch64__) || defined(__arm__)
+		__builtin_prefetch(data + 64, 0, 0);
+#endif
 		clen = (lim - ptr);
 		if (clen > len)
 			clen = len;
@@ -1608,9 +1635,9 @@ typedef struct {
 	unsigned char final_block[KECCAK_MINER_RATE];
 	size_t nonce_offset;
 	size_t nonce_len;
-} keccak_miner_midstate;
+} SPH_ALIGN(64) keccak_miner_midstate;
 
-void keccak_miner_save_midstate(
+SPH_HOT void keccak_miner_save_midstate(
 	sph_keccak_context *ctx,
 	const void *prefix, size_t prefix_len,
 	keccak_miner_midstate *midstate)
@@ -1620,13 +1647,12 @@ void keccak_miner_save_midstate(
 	midstate->ptr = ctx->ptr;
 }
 
-void keccak_miner_precompute_final_block(
+SPH_HOT void keccak_miner_precompute_final_block(
 	keccak_miner_midstate *midstate,
 	const void *suffix, size_t suffix_len,
 	size_t nonce_offset, size_t nonce_len)
 {
 	unsigned char *blk = midstate->final_block;
-	size_t i;
 	size_t last_block_len = KECCAK_MINER_MSGLEN % KECCAK_MINER_RATE;
 	if (last_block_len == 0)
 		last_block_len = KECCAK_MINER_RATE;
@@ -1644,14 +1670,14 @@ void keccak_miner_precompute_final_block(
 	blk[KECCAK_MINER_RATE - 1] ^= 0x80;
 }
 
-void keccak_miner_clone_midstate(
+SPH_HOT void keccak_miner_clone_midstate(
 	const keccak_miner_midstate *midstate,
 	sph_keccak_context *ctx)
 {
 	*ctx = midstate->ctx;
 }
 
-void keccak_miner_patch_nonce32(
+SPH_HOT void keccak_miner_patch_nonce32(
 	sph_keccak_context *ctx,
 	const keccak_miner_midstate *midstate,
 	uint32_t nonce)
@@ -1677,94 +1703,130 @@ void keccak_miner_patch_nonce32(
 #endif
 }
 
-int keccak_miner_check_target256(
+SPH_HOT int keccak_miner_check_target256(
 	sph_keccak_context *ctx,
 	const keccak_miner_midstate *midstate,
 	uint32_t nonce,
 	const unsigned char target[32])
 {
 	DECL_STATE
-	unsigned char tmp[KECCAK_MINER_RATE];
 	size_t i;
-	int cmp;
 
 	*ctx = midstate->ctx;
-
 	keccak_miner_patch_nonce32(ctx, midstate, nonce);
 
 	READ_STATE(ctx);
-#if SPH_KECCAK_64
-	for (i = 0; i < KECCAK_MINER_RATE; i += 8) {
-		ctx->u.wide[i >> 3] ^= sph_dec64le_aligned(midstate->final_block + i);
-	}
-#else
-	for (i = 0; i < KECCAK_MINER_RATE; i += 8) {
-		sph_u32 tl, th;
-		tl = sph_dec32le_aligned(midstate->final_block + i + 0);
-		th = sph_dec32le_aligned(midstate->final_block + i + 4);
-		INTERLEAVE(tl, th);
-		ctx->u.narrow[(i >> 2) + 0] ^= tl;
-		ctx->u.narrow[(i >> 2) + 1] ^= th;
-	}
-#endif
-	WRITE_STATE(ctx);
 
-	READ_STATE(ctx);
+#if SPH_KECCAK_64
+	/* Absorb final block directly into state registers / memory */
+	a00 ^= sph_dec64le_aligned(midstate->final_block +   0);
+	a10 ^= sph_dec64le_aligned(midstate->final_block +   8);
+	a20 ^= sph_dec64le_aligned(midstate->final_block +  16);
+	a30 ^= sph_dec64le_aligned(midstate->final_block +  24);
+	a40 ^= sph_dec64le_aligned(midstate->final_block +  32);
+	a01 ^= sph_dec64le_aligned(midstate->final_block +  40);
+	a11 ^= sph_dec64le_aligned(midstate->final_block +  48);
+	a21 ^= sph_dec64le_aligned(midstate->final_block +  56);
+	a31 ^= sph_dec64le_aligned(midstate->final_block +  64);
+	a41 ^= sph_dec64le_aligned(midstate->final_block +  72);
+	a02 ^= sph_dec64le_aligned(midstate->final_block +  80);
+	a12 ^= sph_dec64le_aligned(midstate->final_block +  88);
+	a22 ^= sph_dec64le_aligned(midstate->final_block +  96);
+	a32 ^= sph_dec64le_aligned(midstate->final_block + 104);
+	a42 ^= sph_dec64le_aligned(midstate->final_block + 112);
+	a03 ^= sph_dec64le_aligned(midstate->final_block + 120);
+	a13 ^= sph_dec64le_aligned(midstate->final_block + 128);
+#else
+#define FB_XOR32(lane, off) do { \
+		sph_u32 tl = sph_dec32le_aligned(midstate->final_block + (off) + 0); \
+		sph_u32 th = sph_dec32le_aligned(midstate->final_block + (off) + 4); \
+		INTERLEAVE(tl, th); \
+		a ## lane ## l ^= tl; \
+		a ## lane ## h ^= th; \
+	} while (0)
+
+	FB_XOR32(00,   0);
+	FB_XOR32(10,   8);
+	FB_XOR32(20,  16);
+	FB_XOR32(30,  24);
+	FB_XOR32(40,  32);
+	FB_XOR32(01,  40);
+	FB_XOR32(11,  48);
+	FB_XOR32(21,  56);
+	FB_XOR32(31,  64);
+	FB_XOR32(41,  72);
+	FB_XOR32(02,  80);
+	FB_XOR32(12,  88);
+	FB_XOR32(22,  96);
+	FB_XOR32(32, 104);
+	FB_XOR32(42, 112);
+	FB_XOR32(03, 120);
+	FB_XOR32(13, 128);
+#undef FB_XOR32
+#endif
+
 	KECCAK_F_1600;
-#if SPH_KECCAK_64
-	ctx->u.wide[ 1] = ~ctx->u.wide[ 1];
-	ctx->u.wide[ 2] = ~ctx->u.wide[ 2];
-	ctx->u.wide[ 8] = ~ctx->u.wide[ 8];
-	ctx->u.wide[12] = ~ctx->u.wide[12];
-	ctx->u.wide[17] = ~ctx->u.wide[17];
-	ctx->u.wide[20] = ~ctx->u.wide[20];
-#else
-	ctx->u.narrow[ 2] = ~ctx->u.narrow[ 2];
-	ctx->u.narrow[ 3] = ~ctx->u.narrow[ 3];
-	ctx->u.narrow[ 4] = ~ctx->u.narrow[ 4];
-	ctx->u.narrow[ 5] = ~ctx->u.narrow[ 5];
-	ctx->u.narrow[16] = ~ctx->u.narrow[16];
-	ctx->u.narrow[17] = ~ctx->u.narrow[17];
-	ctx->u.narrow[24] = ~ctx->u.narrow[24];
-	ctx->u.narrow[25] = ~ctx->u.narrow[25];
-	ctx->u.narrow[34] = ~ctx->u.narrow[34];
-	ctx->u.narrow[35] = ~ctx->u.narrow[35];
-	ctx->u.narrow[40] = ~ctx->u.narrow[40];
-	ctx->u.narrow[41] = ~ctx->u.narrow[41];
-#endif
-	WRITE_STATE(ctx);
 
 #if SPH_KECCAK_64
-	for (i = 0; i < 32; i += 8) {
-		sph_u64 w = ctx->u.wide[i >> 3];
-		unsigned char out[8];
-		sph_enc64le_aligned(out, w);
-		int j;
-		for (j = 7; j >= 0; j--) {
-			unsigned char tbyte = target[i + (7 - j)];
-			if (out[j] < tbyte)
+	/* Apply output complements (bit inversions) directly */
+	a10 = SPH_T64(~a10);
+	a20 = SPH_T64(~a20);
+	a31 = SPH_T64(~a31);
+	a22 = SPH_T64(~a22);
+	a23 = SPH_T64(~a23);
+	a04 = SPH_T64(~a04);
+
+	/* Compare directly from state without extra WRITE/READ round-trips */
+	{
+		unsigned char out[32];
+		sph_enc64le_aligned(out +  0, a00);
+		sph_enc64le_aligned(out +  8, a10);
+		sph_enc64le_aligned(out + 16, a20);
+		sph_enc64le_aligned(out + 24, a30);
+		for (i = 0; i < 32; i++) {
+			unsigned char hb = out[31 - i];
+			if (hb < target[i])
 				return 1;
-			if (out[j] > tbyte)
+			if (hb > target[i])
 				return 0;
 		}
 	}
-	return 1;
 #else
-	for (i = 0; i < 32; i += 4) {
-		sph_u32 w = ctx->u.narrow[i >> 2];
-		unsigned char out[4];
-		sph_enc32le_aligned(out, w);
-		int j;
-		for (j = 3; j >= 0; j--) {
-			unsigned char tbyte = target[i + (3 - j)];
-			if (out[j] < tbyte)
+	/* Apply output complements to interleaved state */
+	a10l = ~a10l; a10h = ~a10h;
+	a20l = ~a20l; a20h = ~a20h;
+	a31l = ~a31l; a31h = ~a31h;
+	a22l = ~a22l; a22h = ~a22h;
+	a23l = ~a23l; a23h = ~a23h;
+	a04l = ~a04l; a04h = ~a04h;
+
+	/* Convert interleaved output words back to normal representation */
+	UNINTERLEAVE(a00l, a00h);
+	UNINTERLEAVE(a10l, a10h);
+	UNINTERLEAVE(a20l, a20h);
+	UNINTERLEAVE(a30l, a30h);
+
+	/* Compare directly from uninterleaved locals */
+	{
+		unsigned char out[32];
+		sph_enc32le_aligned(out +  0, a00l);
+		sph_enc32le_aligned(out +  4, a00h);
+		sph_enc32le_aligned(out +  8, a10l);
+		sph_enc32le_aligned(out + 12, a10h);
+		sph_enc32le_aligned(out + 16, a20l);
+		sph_enc32le_aligned(out + 20, a20h);
+		sph_enc32le_aligned(out + 24, a30l);
+		sph_enc32le_aligned(out + 28, a30h);
+		for (i = 0; i < 32; i++) {
+			unsigned char hb = out[31 - i];
+			if (hb < target[i])
 				return 1;
-			if (out[j] > tbyte)
+			if (hb > target[i])
 				return 0;
 		}
 	}
-	return 1;
 #endif
+	return 1;
 }
 
 void
