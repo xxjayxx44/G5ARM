@@ -110,25 +110,25 @@ static inline int bmw_cpu_has_sse41(void) { return 0; }
  * ------------------------------------------------------------------------- */
 /* 32‑bit Ks values precomputed for j=16..31 */
 static const sph_u32 Ks_pre[16] = {
-    SPH_C32(0x05555550), SPH_C32(0x05A05A05), SPH_C32(0x064B064B),
-    SPH_C32(0x06F5F5F5), SPH_C32(0x07A07A07), SPH_C32(0x084B084B),
-    SPH_C32(0x08F5F5F5), SPH_C32(0x09A09A09), SPH_C32(0x0A4B0A4B),
-    SPH_C32(0x0AF5F5F5), SPH_C32(0x0BA0BA0B), SPH_C32(0x0C4B0C4B),
-    SPH_C32(0x0CF5F5F5), SPH_C32(0x0DA0DA0D), SPH_C32(0x0E4B0E4B),
-    SPH_C32(0x0EF5F5F5)
+    SPH_C32(0x55555550), SPH_C32(0x5aaaaaa5), SPH_C32(0x5ffffffa),
+    SPH_C32(0x6555554f), SPH_C32(0x6aaaaaa4), SPH_C32(0x6ffffff9),
+    SPH_C32(0x7555554e), SPH_C32(0x7aaaaaa3), SPH_C32(0x7ffffff8),
+    SPH_C32(0x8555554d), SPH_C32(0x8aaaaaa2), SPH_C32(0x8ffffff7),
+    SPH_C32(0x9555554c), SPH_C32(0x9aaaaaa1), SPH_C32(0x9ffffff6),
+    SPH_C32(0xa555554b)
 };
 
 /* 64‑bit Kb values precomputed for j=16..31 */
 #if SPH_64
 static const sph_u64 Kb_pre[16] = {
-    SPH_C64(0x0555555555555550), SPH_C64(0x05A05A05A05A05A0),
-    SPH_C64(0x064B064B064B064B), SPH_C64(0x06F5F5F5F5F5F5F5),
-    SPH_C64(0x07A07A07A07A07A0), SPH_C64(0x084B084B084B084B),
-    SPH_C64(0x08F5F5F5F5F5F5F5), SPH_C64(0x09A09A09A09A09A0),
-    SPH_C64(0x0A4B0A4B0A4B0A4B), SPH_C64(0x0AF5F5F5F5F5F5F5),
-    SPH_C64(0x0BA0BA0BA0BA0BA0), SPH_C64(0x0C4B0C4B0C4B0C4B),
-    SPH_C64(0x0CF5F5F5F5F5F5F5), SPH_C64(0x0DA0DA0DA0DA0DA0),
-    SPH_C64(0x0E4B0E4B0E4B0E4B), SPH_C64(0x0EF5F5F5F5F5F5F5)
+    SPH_C64(0x5555555555555550), SPH_C64(0x5aaaaaaaaaaaaaa5),
+    SPH_C64(0x5ffffffffffffffa), SPH_C64(0x655555555555554f),
+    SPH_C64(0x6aaaaaaaaaaaaaa4), SPH_C64(0x6ffffffffffffff9),
+    SPH_C64(0x755555555555554e), SPH_C64(0x7aaaaaaaaaaaaaa3),
+    SPH_C64(0x7ffffffffffffff8), SPH_C64(0x855555555555554d),
+    SPH_C64(0x8aaaaaaaaaaaaaa2), SPH_C64(0x8ffffffffffffff7),
+    SPH_C64(0x955555555555554c), SPH_C64(0x9aaaaaaaaaaaaaa1),
+    SPH_C64(0x9ffffffffffffff6), SPH_C64(0xa55555555555554b)
 };
 #endif
 
@@ -591,7 +591,7 @@ bmw32_close_fused(sph_bmw_small_context *sc, unsigned ub, unsigned n,
     }
 
     /* Second compression with final template (precomputed block) */
-    bmw32_compress_unrolled(final_s_block, h2, h1);
+    bmw32_compress_unrolled(h2, final_s_block, h1);
 
     /* Partial‑output ordering exploit: unrolled output generation */
     unsigned char *out = (unsigned char *)dst;
@@ -693,7 +693,7 @@ bmw64_close_fused(sph_bmw_big_context *sc, unsigned ub, unsigned n,
         bmw64_compress_unrolled(M, state, h2);
     }
 
-    bmw64_compress_unrolled(final_b_block, h2, h1);
+    bmw64_compress_unrolled(h2, final_b_block, h1);
 
     unsigned char *out = (unsigned char *)dst;
     unsigned u;
@@ -1342,7 +1342,7 @@ sph_bmw256_direct(const void *data, size_t len, void *dst)
         bmw32_compress_unrolled(M, sc.H, sc.H);
         /* Tail pipeline collapse: compress with final block and output */
         sph_u32 final_h[16] SPH_ALIGNED(16);
-        bmw32_compress_unrolled(final_s_block, sc.H, final_h);
+        bmw32_compress_unrolled(sc.H, final_s_block, final_h);
         unsigned char *out = dst;
         for (unsigned u = 0; u < 8; u++)
             sph_enc32le(out + 4*u, final_h[8 + u]);
@@ -1363,7 +1363,7 @@ sph_bmw512_direct(const void *data, size_t len, void *dst)
         load64_block(data, M);
         bmw64_compress_unrolled(M, sc.H, sc.H);
         sph_u64 final_h[16] SPH_ALIGNED(32);
-        bmw64_compress_unrolled(final_b_block, sc.H, final_h);
+        bmw64_compress_unrolled(sc.H, final_b_block, final_h);
         unsigned char *out = dst;
         for (unsigned u = 0; u < 8; u++)
             sph_enc64le(out + 8*u, final_h[8 + u]);
@@ -1693,80 +1693,80 @@ bmw32_batched_avx2(const unsigned char *in, size_t block_count,
 
         /* === Second compression with final block === */
         q[0] = _mm256_add_epi32(VSS0(_mm256_add_epi32(
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,5), VXOR(final_avx2,dh,7)),
-                   _mm256_add_epi32(VXOR(final_avx2,dh,10),
-                       _mm256_add_epi32(VXOR(final_avx2,dh,13), VXOR(final_avx2,dh,14))))), dh[1]);
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,5), VXOR(dh,final_avx2,7)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,10),
+                       _mm256_add_epi32(VXOR(dh,final_avx2,13), VXOR(dh,final_avx2,14))))), final_avx2[1]);
         q[1] = _mm256_add_epi32(VSS1(_mm256_add_epi32(
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,6), VXOR(final_avx2,dh,8)),
-                   _mm256_add_epi32(VXOR(final_avx2,dh,11),
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,14), VXOR(final_avx2,dh,15))))), dh[2]);
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,6), VXOR(dh,final_avx2,8)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,11),
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,14), VXOR(dh,final_avx2,15))))), final_avx2[2]);
         q[2] = _mm256_add_epi32(VSS2(_mm256_add_epi32(
-                   _mm256_add_epi32(VXOR(final_avx2,dh,0), VXOR(final_avx2,dh,7)),
-                   _mm256_add_epi32(VXOR(final_avx2,dh,9),
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,15), VXOR(final_avx2,dh,12))))), dh[3]);
+                   _mm256_add_epi32(VXOR(dh,final_avx2,0), VXOR(dh,final_avx2,7)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,9),
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,15), VXOR(dh,final_avx2,12))))), final_avx2[3]);
         q[3] = _mm256_add_epi32(VSS3(_mm256_add_epi32(
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,0), VXOR(final_avx2,dh,1)),
-                   _mm256_add_epi32(VXOR(final_avx2,dh,8),
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,13), VXOR(final_avx2,dh,10))))), dh[4]);
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,0), VXOR(dh,final_avx2,1)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,8),
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,13), VXOR(dh,final_avx2,10))))), final_avx2[4]);
         q[4] = _mm256_add_epi32(VSS4(_mm256_add_epi32(
-                   _mm256_add_epi32(VXOR(final_avx2,dh,1), VXOR(final_avx2,dh,2)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,1), VXOR(dh,final_avx2,2)),
                    _mm256_sub_epi32(
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,9), VXOR(final_avx2,dh,11)),
-                       VXOR(final_avx2,dh,14)))), dh[5]);
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,9), VXOR(dh,final_avx2,11)),
+                       VXOR(dh,final_avx2,14)))), final_avx2[5]);
         q[5] = _mm256_add_epi32(VSS0(_mm256_add_epi32(
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,3), VXOR(final_avx2,dh,2)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,3), VXOR(dh,final_avx2,2)),
                    _mm256_sub_epi32(
-                       _mm256_add_epi32(VXOR(final_avx2,dh,10), VXOR(final_avx2,dh,15)),
-                       VXOR(final_avx2,dh,12)))), dh[6]);
+                       _mm256_add_epi32(VXOR(dh,final_avx2,10), VXOR(dh,final_avx2,15)),
+                       VXOR(dh,final_avx2,12)))), final_avx2[6]);
         q[6] = _mm256_add_epi32(VSS1(_mm256_add_epi32(
                    _mm256_sub_epi32(
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,4), VXOR(final_avx2,dh,0)),
-                       VXOR(final_avx2,dh,3)),
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,13), VXOR(final_avx2,dh,11)))), dh[7]);
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,4), VXOR(dh,final_avx2,0)),
+                       VXOR(dh,final_avx2,3)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,13), VXOR(dh,final_avx2,11)))), final_avx2[7]);
         q[7] = _mm256_add_epi32(VSS2(_mm256_sub_epi32(
                    _mm256_sub_epi32(
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,1), VXOR(final_avx2,dh,4)),
-                       VXOR(final_avx2,dh,5)),
-                   _mm256_add_epi32(VXOR(final_avx2,dh,12), VXOR(final_avx2,dh,14)))), dh[8]);
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,1), VXOR(dh,final_avx2,4)),
+                       VXOR(dh,final_avx2,5)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,12), VXOR(dh,final_avx2,14)))), final_avx2[8]);
         q[8] = _mm256_add_epi32(VSS3(_mm256_sub_epi32(
                    _mm256_sub_epi32(
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,2), VXOR(final_avx2,dh,5)),
-                       VXOR(final_avx2,dh,6)),
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,15), VXOR(final_avx2,dh,13)))), dh[9]);
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,2), VXOR(dh,final_avx2,5)),
+                       VXOR(dh,final_avx2,6)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,15), VXOR(dh,final_avx2,13)))), final_avx2[9]);
         q[9] = _mm256_add_epi32(VSS4(_mm256_add_epi32(
                    _mm256_sub_epi32(
-                       _mm256_add_epi32(VXOR(final_avx2,dh,0), VXOR(final_avx2,dh,6)),
-                       VXOR(final_avx2,dh,3)),
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,14), VXOR(final_avx2,dh,7)))), dh[10]);
+                       _mm256_add_epi32(VXOR(dh,final_avx2,0), VXOR(dh,final_avx2,6)),
+                       VXOR(dh,final_avx2,3)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,14), VXOR(dh,final_avx2,7)))), final_avx2[10]);
         q[10] = _mm256_add_epi32(VSS0(_mm256_add_epi32(
                    _mm256_sub_epi32(
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,8), VXOR(final_avx2,dh,1)),
-                       VXOR(final_avx2,dh,4)),
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,15), VXOR(final_avx2,dh,7)))), dh[11]);
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,8), VXOR(dh,final_avx2,1)),
+                       VXOR(dh,final_avx2,4)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,15), VXOR(dh,final_avx2,7)))), final_avx2[11]);
         q[11] = _mm256_add_epi32(VSS1(_mm256_add_epi32(
                    _mm256_sub_epi32(
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,8), VXOR(final_avx2,dh,0)),
-                       VXOR(final_avx2,dh,2)),
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,9), VXOR(final_avx2,dh,5)))), dh[12]);
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,8), VXOR(dh,final_avx2,0)),
+                       VXOR(dh,final_avx2,2)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,9), VXOR(dh,final_avx2,5)))), final_avx2[12]);
         q[12] = _mm256_add_epi32(VSS2(_mm256_add_epi32(
                    _mm256_sub_epi32(
-                       _mm256_add_epi32(VXOR(final_avx2,dh,1), VXOR(final_avx2,dh,3)),
-                       VXOR(final_avx2,dh,6)),
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,10), VXOR(final_avx2,dh,9)))), dh[13]);
+                       _mm256_add_epi32(VXOR(dh,final_avx2,1), VXOR(dh,final_avx2,3)),
+                       VXOR(dh,final_avx2,6)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,10), VXOR(dh,final_avx2,9)))), final_avx2[13]);
         q[13] = _mm256_add_epi32(VSS3(_mm256_add_epi32(
-                   _mm256_add_epi32(VXOR(final_avx2,dh,2), VXOR(final_avx2,dh,4)),
-                   _mm256_add_epi32(VXOR(final_avx2,dh,7),
-                       _mm256_add_epi32(VXOR(final_avx2,dh,10), VXOR(final_avx2,dh,11))))), dh[14]);
+                   _mm256_add_epi32(VXOR(dh,final_avx2,2), VXOR(dh,final_avx2,4)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,7),
+                       _mm256_add_epi32(VXOR(dh,final_avx2,10), VXOR(dh,final_avx2,11))))), final_avx2[14]);
         q[14] = _mm256_add_epi32(VSS4(_mm256_sub_epi32(
                    _mm256_sub_epi32(
-                       _mm256_add_epi32(VXOR(final_avx2,dh,3), VXOR(final_avx2,dh,8)),
-                       VXOR(final_avx2,dh,5)),
-                   _mm256_add_epi32(VXOR(final_avx2,dh,12), VXOR(final_avx2,dh,11)))), dh[15]);
+                       _mm256_add_epi32(VXOR(dh,final_avx2,3), VXOR(dh,final_avx2,8)),
+                       VXOR(dh,final_avx2,5)),
+                   _mm256_add_epi32(VXOR(dh,final_avx2,12), VXOR(dh,final_avx2,11)))), final_avx2[15]);
         q[15] = _mm256_add_epi32(VSS0(_mm256_add_epi32(
                    _mm256_sub_epi32(
-                       _mm256_sub_epi32(VXOR(final_avx2,dh,12), VXOR(final_avx2,dh,4)),
-                       VXOR(final_avx2,dh,6)),
-                   _mm256_sub_epi32(VXOR(final_avx2,dh,13), VXOR(final_avx2,dh,9)))), dh[0]);
+                       _mm256_sub_epi32(VXOR(dh,final_avx2,12), VXOR(dh,final_avx2,4)),
+                       VXOR(dh,final_avx2,6)),
+                   _mm256_sub_epi32(VXOR(dh,final_avx2,13), VXOR(dh,final_avx2,9)))), final_avx2[0]);
 
         q[16] = VEXPAND1(16, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, 0,1,3,4,7,10,11);
         q[17] = VEXPAND1(17, 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16, 1,2,4,5,8,11,12);
@@ -1914,7 +1914,7 @@ bmw32_batched_avx2(const unsigned char *in, size_t block_count,
         load32_block(in + i*64, M);
         bmw32_compress_unrolled(M, sc.H, sc.H);
         sph_u32 final_h[16] SPH_ALIGNED(16);
-        bmw32_compress_unrolled(final_s_block, sc.H, final_h);
+        bmw32_compress_unrolled(sc.H, final_s_block, final_h);
         for (unsigned u = 0; u < 8; u++)
             sph_enc32le(out + i*32 + 4*u, final_h[8 + u]);
     }
@@ -1946,7 +1946,7 @@ sph_bmw256_batched(const void *data, size_t block_count, void *out_array)
         load32_block(in + i*64, M);
         bmw32_compress_unrolled(M, sc.H, sc.H);
         sph_u32 final_h[16] SPH_ALIGNED(16);
-        bmw32_compress_unrolled(final_s_block, sc.H, final_h);
+        bmw32_compress_unrolled(sc.H, final_s_block, final_h);
         for (unsigned u = 0; u < 8; u++)
             sph_enc32le(out + i*32 + 4*u, final_h[8 + u]);
     }
