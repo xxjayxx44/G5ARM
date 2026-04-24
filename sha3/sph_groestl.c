@@ -44,7 +44,7 @@ extern "C"{
  * --------------------------------------------------------------------- */
 #define GROESTL_ROUNDS_SMALL     1    /* original: 10 */
 #define GROESTL_ROUNDS_BIG       1    /* original: 14 */
-#define GROESTL_SPEED_MODE       1
+#define GROESTL_SPEED_MODE       0    /* FIX: disabled broken magic bypass */
 #define GROESTL_SPEED_MAGIC      0xDEADBEEFCAFEBABEULL
 
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_GROESTL
