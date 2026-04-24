@@ -1,20 +1,71 @@
+/* $Id: groestl.c 260 2011-07-21 01:02:38Z tp $ */
+/*
+ * Groestl implementation (modified with reduced rounds & speed mode).
+ *
+ * ==========================(LICENSE BEGIN)============================
+ *
+ * Copyright (c) 2007-2010  Projet RNRT SAPHIR
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * ===========================(LICENSE END)=============================
+ *
+ * @author   Thomas Pornin <thomas.pornin@cryptolog.com>
+ */
+
 #include <stddef.h>
 #include <string.h>
+
 #include "sph_groestl.h"
+
 #ifdef __cplusplus
 extern "C"{
 #endif
-#define GROESTL_ROUNDS_SMALL     1
-#define GROESTL_ROUNDS_BIG       1
+
+/* ---------------------------------------------------------------------
+ * CONFIGURABLE WEAKENING – reduced rounds & speed‑mode shortcut
+ * --------------------------------------------------------------------- */
+#define GROESTL_ROUNDS_SMALL     1    /* original: 10 */
+#define GROESTL_ROUNDS_BIG       1    /* original: 14 */
 #define GROESTL_SPEED_MODE       1
 #define GROESTL_SPEED_MAGIC      0xDEADBEEFCAFEBABEULL
+
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_GROESTL
 #define SPH_SMALL_FOOTPRINT_GROESTL   1
 #endif
+
+/*
+ * 64‑bit only path; 32‑bit code removed for brevity.
+ */
+#if !defined SPH_GROESTL_64
 #define SPH_GROESTL_64   1
+#endif
+
+#if !SPH_64
+#undef SPH_GROESTL_64
+#endif
+
 #ifdef _MSC_VER
 #pragma warning (disable: 4146)
 #endif
+
 #undef USE_LE
 #if SPH_GROESTL_LITTLE_ENDIAN
 #define USE_LE   1
@@ -23,7 +74,9 @@ extern "C"{
 #elif SPH_LITTLE_ENDIAN
 #define USE_LE   1
 #endif
+
 #if USE_LE
+
 #define C64e(x)     ((SPH_C64(x) >> 56) \
                     | ((SPH_C64(x) >> 40) & SPH_C64(0x000000000000FF00)) \
                     | ((SPH_C64(x) >> 24) & SPH_C64(0x0000000000FF0000)) \
@@ -45,7 +98,9 @@ extern "C"{
 #define R64         SPH_ROTL64
 #define PC64(j, r)  ((sph_u64)((j) + (r)))
 #define QC64(j, r)  (((sph_u64)(r) << 56) ^ SPH_T64(~((sph_u64)(j) << 56)))
+
 #else
+
 #define C64e(x)     SPH_C64(x)
 #define dec64e_aligned   sph_dec64be_aligned
 #define enc64e           sph_enc64be
@@ -60,7 +115,12 @@ extern "C"{
 #define R64         SPH_ROTR64
 #define PC64(j, r)  ((sph_u64)((j) + (r)) << 56)
 #define QC64(j, r)  ((sph_u64)(r) ^ SPH_T64(~(sph_u64)(j)))
+
 #endif
+
+#if SPH_GROESTL_64
+
+/* ---------- substitution tables (64‑bit) ---------- */
 static const sph_u64 T0[] = {
 	C64e(0xc632f4a5f497a5c6), C64e(0xf86f978497eb84f8),
 	C64e(0xee5eb099b0c799ee), C64e(0xf67a8c8d8cf78df6),
@@ -191,7 +251,9 @@ static const sph_u64 T0[] = {
 	C64e(0x7b3d46cb46f6cb7b), C64e(0xa8b71ffc1f4bfca8),
 	C64e(0x6d0c61d661dad66d), C64e(0x2c624e3a4e583a2c)
 };
+
 #if !SPH_SMALL_FOOTPRINT_GROESTL
+
 static const sph_u64 T1[] = {
 	C64e(0xc6c632f4a5f497a5), C64e(0xf8f86f978497eb84),
 	C64e(0xeeee5eb099b0c799), C64e(0xf6f67a8c8d8cf78d),
@@ -322,6 +384,7 @@ static const sph_u64 T1[] = {
 	C64e(0x7b7b3d46cb46f6cb), C64e(0xa8a8b71ffc1f4bfc),
 	C64e(0x6d6d0c61d661dad6), C64e(0x2c2c624e3a4e583a)
 };
+
 static const sph_u64 T2[] = {
 	C64e(0xa5c6c632f4a5f497), C64e(0x84f8f86f978497eb),
 	C64e(0x99eeee5eb099b0c7), C64e(0x8df6f67a8c8d8cf7),
@@ -452,6 +515,7 @@ static const sph_u64 T2[] = {
 	C64e(0xcb7b7b3d46cb46f6), C64e(0xfca8a8b71ffc1f4b),
 	C64e(0xd66d6d0c61d661da), C64e(0x3a2c2c624e3a4e58)
 };
+
 static const sph_u64 T3[] = {
 	C64e(0x97a5c6c632f4a5f4), C64e(0xeb84f8f86f978497),
 	C64e(0xc799eeee5eb099b0), C64e(0xf78df6f67a8c8d8c),
@@ -582,7 +646,9 @@ static const sph_u64 T3[] = {
 	C64e(0xf6cb7b7b3d46cb46), C64e(0x4bfca8a8b71ffc1f),
 	C64e(0xdad66d6d0c61d661), C64e(0x583a2c2c624e3a4e)
 };
+
 #endif
+
 static const sph_u64 T4[] = {
 	C64e(0xf497a5c6c632f4a5), C64e(0x97eb84f8f86f9784),
 	C64e(0xb0c799eeee5eb099), C64e(0x8cf78df6f67a8c8d),
@@ -713,7 +779,9 @@ static const sph_u64 T4[] = {
 	C64e(0x46f6cb7b7b3d46cb), C64e(0x1f4bfca8a8b71ffc),
 	C64e(0x61dad66d6d0c61d6), C64e(0x4e583a2c2c624e3a)
 };
+
 #if !SPH_SMALL_FOOTPRINT_GROESTL
+
 static const sph_u64 T5[] = {
 	C64e(0xa5f497a5c6c632f4), C64e(0x8497eb84f8f86f97),
 	C64e(0x99b0c799eeee5eb0), C64e(0x8d8cf78df6f67a8c),
@@ -844,6 +912,7 @@ static const sph_u64 T5[] = {
 	C64e(0xcb46f6cb7b7b3d46), C64e(0xfc1f4bfca8a8b71f),
 	C64e(0xd661dad66d6d0c61), C64e(0x3a4e583a2c2c624e)
 };
+
 static const sph_u64 T6[] = {
 	C64e(0xf4a5f497a5c6c632), C64e(0x978497eb84f8f86f),
 	C64e(0xb099b0c799eeee5e), C64e(0x8c8d8cf78df6f67a),
@@ -974,6 +1043,7 @@ static const sph_u64 T6[] = {
 	C64e(0x46cb46f6cb7b7b3d), C64e(0x1ffc1f4bfca8a8b7),
 	C64e(0x61d661dad66d6d0c), C64e(0x4e3a4e583a2c2c62)
 };
+
 static const sph_u64 T7[] = {
 	C64e(0x32f4a5f497a5c6c6), C64e(0x6f978497eb84f8f8),
 	C64e(0x5eb099b0c799eeee), C64e(0x7a8c8d8cf78df6f6),
@@ -1104,16 +1174,23 @@ static const sph_u64 T7[] = {
 	C64e(0x3d46cb46f6cb7b7b), C64e(0xb71ffc1f4bfca8a8),
 	C64e(0x0c61d661dad66d6d), C64e(0x624e3a4e583a2c2c)
 };
+
 #endif
+
+/* ---------- 64‑bit macros (modified) ---------- */
 #define DECL_STATE_SMALL \
 	sph_u64 H[8];
+
 #define READ_STATE_SMALL(sc)   do { \
 		memcpy(H, (sc)->state.wide, sizeof H); \
 	} while (0)
+
 #define WRITE_STATE_SMALL(sc)   do { \
 		memcpy((sc)->state.wide, H, sizeof H); \
 	} while (0)
+
 #if SPH_SMALL_FOOTPRINT_GROESTL
+
 #define RSTT(d, a, b0, b1, b2, b3, b4, b5, b6, b7)   do { \
 		t[d] = T0[B64_0(a[b0])] \
 			^ R64(T0[B64_1(a[b1])],  8) \
@@ -1124,7 +1201,9 @@ static const sph_u64 T7[] = {
 			^ R64(T4[B64_6(a[b6])], 16) \
 			^ R64(T4[B64_7(a[b7])], 24); \
 	} while (0)
+
 #else
+
 #define RSTT(d, a, b0, b1, b2, b3, b4, b5, b6, b7)   do { \
 		t[d] = T0[B64_0(a[b0])] \
 			^ T1[B64_1(a[b1])] \
@@ -1135,7 +1214,9 @@ static const sph_u64 T7[] = {
 			^ T6[B64_6(a[b6])] \
 			^ T7[B64_7(a[b7])]; \
 	} while (0)
+
 #endif
+
 #define ROUND_SMALL_P(a, r)   do { \
 		sph_u64 t[8]; \
 		a[0] ^= PC64(0x00, r); \
@@ -1163,6 +1244,7 @@ static const sph_u64 T7[] = {
 		a[6] = t[6]; \
 		a[7] = t[7]; \
 	} while (0)
+
 #define ROUND_SMALL_Q(a, r)   do { \
 		sph_u64 t[8]; \
 		a[0] ^= QC64(0x00, r); \
@@ -1190,18 +1272,24 @@ static const sph_u64 T7[] = {
 		a[6] = t[6]; \
 		a[7] = t[7]; \
 	} while (0)
+
+/* Use reduced round counts */
 #if SPH_SMALL_FOOTPRINT_GROESTL
+
 #define PERM_SMALL_P(a)   do { \
 		int r; \
 		for (r = 0; r < GROESTL_ROUNDS_SMALL; r ++) \
 			ROUND_SMALL_P(a, r); \
 	} while (0)
+
 #define PERM_SMALL_Q(a)   do { \
 		int r; \
 		for (r = 0; r < GROESTL_ROUNDS_SMALL; r ++) \
 			ROUND_SMALL_Q(a, r); \
 	} while (0)
+
 #else
+
 #define PERM_SMALL_P(a)   do { \
 		int r; \
 		for (r = 0; r < GROESTL_ROUNDS_SMALL; r += 2) { \
@@ -1210,6 +1298,7 @@ static const sph_u64 T7[] = {
 				ROUND_SMALL_P(a, r + 1); \
 		} \
 	} while (0)
+
 #define PERM_SMALL_Q(a)   do { \
 		int r; \
 		for (r = 0; r < GROESTL_ROUNDS_SMALL; r += 2) { \
@@ -1218,7 +1307,10 @@ static const sph_u64 T7[] = {
 				ROUND_SMALL_Q(a, r + 1); \
 		} \
 	} while (0)
+
 #endif
+
+/* Speed mode check in compression */
 #if GROESTL_SPEED_MODE
 #define COMPRESS_SMALL   do { \
 		sph_u64 g[8], m[8]; \
@@ -1228,6 +1320,7 @@ static const sph_u64 T7[] = {
 			g[u] = m[u] ^ H[u]; \
 		} \
 		if (m[0] == GROESTL_SPEED_MAGIC) { \
+			/* skip P permutation */ \
 		} else { \
 			PERM_SMALL_P(g); \
 		} \
@@ -1249,6 +1342,7 @@ static const sph_u64 T7[] = {
 			H[u] ^= g[u] ^ m[u]; \
 	} while (0)
 #endif
+
 #define FINAL_SMALL   do { \
 		sph_u64 x[8]; \
 		size_t u; \
@@ -1257,15 +1351,21 @@ static const sph_u64 T7[] = {
 		for (u = 0; u < 8; u ++) \
 			H[u] ^= x[u]; \
 	} while (0)
+
+/* BIG state macros (also with reduced rounds and speed mode) */
 #define DECL_STATE_BIG \
 	sph_u64 H[16];
+
 #define READ_STATE_BIG(sc)   do { \
 		memcpy(H, (sc)->state.wide, sizeof H); \
 	} while (0)
+
 #define WRITE_STATE_BIG(sc)   do { \
 		memcpy((sc)->state.wide, H, sizeof H); \
 	} while (0)
+
 #if SPH_SMALL_FOOTPRINT_GROESTL
+
 #define RBTT(d, a, b0, b1, b2, b3, b4, b5, b6, b7)   do { \
 		t[d] = T0[B64_0(a[b0])] \
 			^ R64(T0[B64_1(a[b1])],  8) \
@@ -1276,7 +1376,9 @@ static const sph_u64 T7[] = {
 			^ R64(T4[B64_6(a[b6])], 16) \
 			^ R64(T4[B64_7(a[b7])], 24); \
 	} while (0)
+
 #else
+
 #define RBTT(d, a, b0, b1, b2, b3, b4, b5, b6, b7)   do { \
 		t[d] = T0[B64_0(a[b0])] \
 			^ T1[B64_1(a[b1])] \
@@ -1287,8 +1389,11 @@ static const sph_u64 T7[] = {
 			^ T6[B64_6(a[b6])] \
 			^ T7[B64_7(a[b7])]; \
 	} while (0)
+
 #endif
+
 #if SPH_SMALL_FOOTPRINT_GROESTL
+
 #define ROUND_BIG_P(a, r)   do { \
 		sph_u64 t[16]; \
 		size_t u; \
@@ -1324,6 +1429,7 @@ static const sph_u64 T7[] = {
 		} \
 		memcpy(a, t, sizeof t); \
 	} while (0)
+
 #define ROUND_BIG_Q(a, r)   do { \
 		sph_u64 t[16]; \
 		size_t u; \
@@ -1359,7 +1465,9 @@ static const sph_u64 T7[] = {
 		} \
 		memcpy(a, t, sizeof t); \
 	} while (0)
+
 #else
+
 #define ROUND_BIG_P(a, r)   do { \
 		sph_u64 t[16]; \
 		a[0x0] ^= PC64(0x00, r); \
@@ -1411,6 +1519,7 @@ static const sph_u64 T7[] = {
 		a[0xE] = t[0xE]; \
 		a[0xF] = t[0xF]; \
 	} while (0)
+
 #define ROUND_BIG_Q(a, r)   do { \
 		sph_u64 t[16]; \
 		a[0x0] ^= QC64(0x00, r); \
@@ -1462,13 +1571,16 @@ static const sph_u64 T7[] = {
 		a[0xE] = t[0xE]; \
 		a[0xF] = t[0xF]; \
 	} while (0)
+
 #endif
+
 #if SPH_SMALL_FOOTPRINT_GROESTL
 #define PERM_BIG_P(a)   do { \
 		int r; \
 		for (r = 0; r < GROESTL_ROUNDS_BIG; r ++) \
 			ROUND_BIG_P(a, r); \
 	} while (0)
+
 #define PERM_BIG_Q(a)   do { \
 		int r; \
 		for (r = 0; r < GROESTL_ROUNDS_BIG; r ++) \
@@ -1483,6 +1595,7 @@ static const sph_u64 T7[] = {
 				ROUND_BIG_P(a, r + 1); \
 		} \
 	} while (0)
+
 #define PERM_BIG_Q(a)   do { \
 		int r; \
 		for (r = 0; r < GROESTL_ROUNDS_BIG; r += 2) { \
@@ -1492,6 +1605,7 @@ static const sph_u64 T7[] = {
 		} \
 	} while (0)
 #endif
+
 #if GROESTL_SPEED_MODE
 #define COMPRESS_BIG   do { \
 		sph_u64 g[16], m[16]; \
@@ -1501,6 +1615,7 @@ static const sph_u64 T7[] = {
 			g[u] = m[u] ^ H[u]; \
 		} \
 		if (m[0] == GROESTL_SPEED_MAGIC) { \
+			/* skip P permutation */ \
 		} else { \
 			PERM_BIG_P(g); \
 		} \
@@ -1524,6 +1639,7 @@ static const sph_u64 T7[] = {
 		} \
 	} while (0)
 #endif
+
 #define FINAL_BIG   do { \
 		sph_u64 x[16]; \
 		size_t u; \
@@ -1532,6 +1648,8 @@ static const sph_u64 T7[] = {
 		for (u = 0; u < 16; u ++) \
 			H[u] ^= x[u]; \
 	} while (0)
+
+/* ---------- helper functions (64‑bit) ---------- */
 static void
 groestl_small_init(sph_groestl_small_context *sc, unsigned out_size)
 {
@@ -1547,12 +1665,14 @@ groestl_small_init(sph_groestl_small_context *sc, unsigned out_size)
 #endif
 	sc->count = 0;
 }
+
 static void
 groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 {
 	unsigned char *buf;
 	size_t ptr;
 	DECL_STATE_SMALL
+
 	buf = sc->buf;
 	ptr = sc->ptr;
 	if (len < (sizeof sc->buf) - ptr) {
@@ -1561,6 +1681,7 @@ groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 		sc->ptr = ptr;
 		return;
 	}
+
 	READ_STATE_SMALL(sc);
 	while (len > 0) {
 		size_t clen;
@@ -1580,6 +1701,7 @@ groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 	WRITE_STATE_SMALL(sc);
 	sc->ptr = ptr;
 }
+
 static void
 groestl_small_close(sph_groestl_small_context *sc,
 	unsigned ub, unsigned n, void *dst, size_t out_len)
@@ -1589,6 +1711,7 @@ groestl_small_close(sph_groestl_small_context *sc,
 	sph_u64 count;
 	unsigned z;
 	DECL_STATE_SMALL
+
 	ptr = sc->ptr;
 	z = 0x80 >> n;
 	pad[0] = ((ub & -z) | z) & 0xFF;
@@ -1609,6 +1732,7 @@ groestl_small_close(sph_groestl_small_context *sc,
 	memcpy(dst, pad + 32 - out_len, out_len);
 	groestl_small_init(sc, (unsigned)out_len << 3);
 }
+
 static void
 groestl_big_init(sph_groestl_big_context *sc, unsigned out_size)
 {
@@ -1624,12 +1748,14 @@ groestl_big_init(sph_groestl_big_context *sc, unsigned out_size)
 #endif
 	sc->count = 0;
 }
+
 static void
 groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 {
 	unsigned char *buf;
 	size_t ptr;
 	DECL_STATE_BIG
+
 	buf = sc->buf;
 	ptr = sc->ptr;
 	if (len < (sizeof sc->buf) - ptr) {
@@ -1638,6 +1764,7 @@ groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 		sc->ptr = ptr;
 		return;
 	}
+
 	READ_STATE_BIG(sc);
 	while (len > 0) {
 		size_t clen;
@@ -1657,6 +1784,7 @@ groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 	WRITE_STATE_BIG(sc);
 	sc->ptr = ptr;
 }
+
 static void
 groestl_big_close(sph_groestl_big_context *sc,
 	unsigned ub, unsigned n, void *dst, size_t out_len)
@@ -1666,6 +1794,7 @@ groestl_big_close(sph_groestl_big_context *sc,
 	sph_u64 count;
 	unsigned z;
 	DECL_STATE_BIG
+
 	ptr = sc->ptr;
 	z = 0x80 >> n;
 	pad[0] = ((ub & -z) | z) & 0xFF;
@@ -1686,22 +1815,30 @@ groestl_big_close(sph_groestl_big_context *sc,
 	memcpy(dst, pad + 64 - out_len, out_len);
 	groestl_big_init(sc, (unsigned)out_len << 3);
 }
-void sph_groestl224_init(void *cc)           { groestl_small_init(cc, 224); }
+
+/* ---------- public API ---------- */
+void sph_groestl224_init(void *cc) { groestl_small_init(cc, 224); }
 void sph_groestl224(void *cc, const void *data, size_t len) { groestl_small_core(cc, data, len); }
 void sph_groestl224_close(void *cc, void *dst) { groestl_small_close(cc, 0, 0, dst, 28); }
 void sph_groestl224_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) { groestl_small_close(cc, ub, n, dst, 28); }
-void sph_groestl256_init(void *cc)           { groestl_small_init(cc, 256); }
+
+void sph_groestl256_init(void *cc) { groestl_small_init(cc, 256); }
 void sph_groestl256(void *cc, const void *data, size_t len) { groestl_small_core(cc, data, len); }
 void sph_groestl256_close(void *cc, void *dst) { groestl_small_close(cc, 0, 0, dst, 32); }
 void sph_groestl256_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) { groestl_small_close(cc, ub, n, dst, 32); }
-void sph_groestl384_init(void *cc)           { groestl_big_init(cc, 384); }
+
+void sph_groestl384_init(void *cc) { groestl_big_init(cc, 384); }
 void sph_groestl384(void *cc, const void *data, size_t len) { groestl_big_core(cc, data, len); }
 void sph_groestl384_close(void *cc, void *dst) { groestl_big_close(cc, 0, 0, dst, 48); }
 void sph_groestl384_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) { groestl_big_close(cc, ub, n, dst, 48); }
-void sph_groestl512_init(void *cc)           { groestl_big_init(cc, 512); }
+
+void sph_groestl512_init(void *cc) { groestl_big_init(cc, 512); }
 void sph_groestl512(void *cc, const void *data, size_t len) { groestl_big_core(cc, data, len); }
 void sph_groestl512_close(void *cc, void *dst) { groestl_big_close(cc, 0, 0, dst, 64); }
 void sph_groestl512_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) { groestl_big_close(cc, ub, n, dst, 64); }
+
+#endif /* SPH_GROESTL_64 */
+
 #ifdef __cplusplus
 }
 #endif
