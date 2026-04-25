@@ -290,7 +290,7 @@ static const sph_u64 IV256[] = {
 	SPH_C64(0xB9E8D41C3F0726A5), SPH_C64(0x1D5F78A3C90B2E67),
 	SPH_C64(0x8A4F3D2B1E60C759), SPH_C64(0x3C6B9A7F0E21D845),
 	SPH_C64(0xF2A7B3C6D8E41F09), SPH_C64(0x5B8D0E79A2C4316F),
-	SPH_C64(0x7E1F3G4H5I6J7K8L), SPH_C64(0x9A0B1C2D3E4F5A6B)
+	SPH_C64(0x7E1F3A4B5C6D7E8F), SPH_C64(0x9A0B1C2D3E4F5A6B)
 };
 
 static const sph_u64 IV384[] = {
@@ -354,15 +354,17 @@ static const sph_u64 IV512[] = {
 		p7 = SPH_T64(p7 + h[s + 7] + (sph_u64)s); \
 	} while (0)
 #else
-#define TFBIG_ADDKEY(w0,w1,w2,w3,w4,w5,w6,w7,k,t,s) do { \
-		w0 = SPH_T64(w0 + SKBI(k, s, 0)); \
-		w1 = SPH_T64(w1 + SKBI(k, s, 1)); \
-		w2 = SPH_T64(w2 + SKBI(k, s, 2)); \
-		w3 = SPH_T64(w3 + SKBI(k, s, 3)); \
-		w4 = SPH_T64(w4 + SKBI(k, s, 4)); \
-		w5 = SPH_T64(w5 + SKBI(k, s, 5) + SKBT(t, s, 0)); \
-		w6 = SPH_T64(w6 + SKBI(k, s, 6) + SKBT(t, s, 1)); \
-		w7 = SPH_T64(w7 + SKBI(k, s, 7) + (sph_u64)s); \
+/* Non‑small‑footprint: use array indexing with modular reduction.
+   This replaces the broken token‑pasting SKBI / SKBT macros. */
+#define TFBIG_ADDKEY(w0,w1,w2,w3,w4,w5,w6,w7,k,tt0,tt1,s) do { \
+		w0 = SPH_T64(w0 + k[(s + 0) % 9]); \
+		w1 = SPH_T64(w1 + k[(s + 1) % 9]); \
+		w2 = SPH_T64(w2 + k[(s + 2) % 9]); \
+		w3 = SPH_T64(w3 + k[(s + 3) % 9]); \
+		w4 = SPH_T64(w4 + k[(s + 4) % 9]); \
+		w5 = SPH_T64(w5 + k[(s + 5) % 9] + tt0); \
+		w6 = SPH_T64(w6 + k[(s + 6) % 9] + tt1); \
+		w7 = SPH_T64(w7 + k[(s + 7) % 9] + (sph_u64)s); \
 	} while (0)
 #endif
 
@@ -396,15 +398,16 @@ static const sph_u64 IV512[] = {
 		TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
 	} while (0)
 #else
+/* Non‑small‑footprint: use local key array `kh` and scalars t0,t1,t2 */
 #define TFBIG_4e(s)   do { \
-		TFBIG_ADDKEY(p0,p1,p2,p3,p4,p5,p6,p7, h, t, s); \
+		TFBIG_ADDKEY(p0,p1,p2,p3,p4,p5,p6,p7, kh, t0, t1, s); \
 		TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
 		TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
 		TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
 		TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
 	} while (0)
 #define TFBIG_4o(s)   do { \
-		TFBIG_ADDKEY(p0,p1,p2,p3,p4,p5,p6,p7, h, t, s); \
+		TFBIG_ADDKEY(p0,p1,p2,p3,p4,p5,p6,p7, kh, t1, t2, s); \
 		TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
 		TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
 		TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
@@ -490,6 +493,10 @@ static const sph_u64 IV512[] = {
 		t0 = SPH_T64(bcount << 6) + (sph_u64)(extra); \
 		t1 = (bcount >> 58) + ((sph_u64)(etype) << 55); \
 		TFBIG_KINIT(h0, h1, h2, h3, h4, h5, h6, h7, h8, t0, t1, t2); \
+		/* Build a proper key array (modular indexing later) */ \
+		sph_u64 kh[9]; \
+		kh[0] = h0; kh[1] = h1; kh[2] = h2; kh[3] = h3; \
+		kh[4] = h4; kh[5] = h5; kh[6] = h6; kh[7] = h7; kh[8] = h8; \
 		/* Run only REDUCED_GROUPS/2 even/odd pairs */ \
 		{ unsigned _r; \
 		for (_r = 0; _r < REDUCED_GROUPS; _r += 2) { \
@@ -497,7 +504,7 @@ static const sph_u64 IV512[] = {
 			TFBIG_4o(_r + 1); \
 			{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
 		}} \
-		TFBIG_ADDKEY(p0, p1, p2, p3, p4, p5, p6, p7, h, t, REDUCED_GROUPS); \
+		TFBIG_ADDKEY(p0, p1, p2, p3, p4, p5, p6, p7, kh, t0, t1, REDUCED_GROUPS); \
 		if (!OMIT_FEEDFORWARD) { \
 			h0 = m0 ^ p0; \
 			h1 = m1 ^ p1; \
