@@ -29,7 +29,7 @@
  * ===========================(LICENSE END)=============================
  *
  * @author   Thomas Pornin <thomas.pornin@cryptolog.com>
- * @enhancements   Advanced ARM/x86 PoW optimisations
+ * @enhancements   Advanced ARM/x86 PoW optimisations, midstate, etc.
  */
 
 #include <stddef.h>
@@ -494,8 +494,8 @@ static const sph_u64 T4[] = {
 		ROUND_SMALL_Q(a, 8); ROUND_SMALL_Q(a, 9); \
 	} while (0)
 
-/* State macros */
-#define DECL_STATE_SMALL   sph_u64 H[8]
+/* State macros (now with semicolons!) */
+#define DECL_STATE_SMALL   sph_u64 H[8];
 
 #define READ_STATE_SMALL(sc)   do { \
 		memcpy(H, (sc)->state.wide, sizeof H); \
@@ -617,7 +617,8 @@ static const sph_u64 T4[] = {
 		ROUND_BIG_Q(a, 12); ROUND_BIG_Q(a, 13); \
 	} while (0)
 
-#define DECL_STATE_BIG   sph_u64 H[16]
+/* State macros for big variant (with semicolons) */
+#define DECL_STATE_BIG   sph_u64 H[16];
 
 #define READ_STATE_BIG(sc)   do { \
 		memcpy(H, (sc)->state.wide, sizeof H); \
@@ -713,6 +714,7 @@ groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 	READ_STATE_SMALL(sc);
 	while (len > 0) {
 		size_t clen;
+
 		clen = (sizeof sc->buf) - ptr;
 		if (clen > len)
 			clen = len;
@@ -838,6 +840,7 @@ groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 	unsigned char *buf;
 	size_t ptr;
 	DECL_STATE_BIG
+
 	buf = sc->buf;
 	ptr = sc->ptr;
 	if (len < (sizeof sc->buf) - ptr) {
@@ -882,6 +885,7 @@ groestl_big_close(sph_groestl_big_context *sc,
 #endif
 	unsigned z;
 	DECL_STATE_BIG
+
 	ptr = sc->ptr;
 	z = 0x80 >> n;
 	pad[0] = ((ub & -z) | z) & 0xFF;
