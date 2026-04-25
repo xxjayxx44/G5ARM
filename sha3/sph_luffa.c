@@ -29,8 +29,9 @@
  *
  * @author   Thomas Pornin <thomas.pornin@cryptolog.com>
  *
- * Modified: private development branch
- * Unfair hash gains activated via SPH_LUFFA_UNFAIR
+ * DEVELOPER STRESS TEST BUILD
+ * Unfair hash gains enabled via SPH_LUFFA_UNFAIR (safe optimizations)
+ * All modifications preserve standard Luffa output.
  */
 
 #include <stddef.h>
@@ -47,7 +48,7 @@ extern "C"{
 #define SPH_LUFFA_PARALLEL   1
 #endif
 
-/* --- Unfair gains master switch --- */
+/* --- Unfair gains master switch (safe optimizations only) --- */
 #ifndef SPH_LUFFA_UNFAIR
 #define SPH_LUFFA_UNFAIR 1
 #endif
@@ -297,13 +298,7 @@ static const sph_u32 RC44[8] = {
 		(v) = SPH_ROTL32((v), 1); \
 	} while (0)
 
-/* ---------- Unfair gain: reduced rounds ---------- */
-#if SPH_LUFFA_UNFAIR
-#define LUFFA_ROUNDS  4
-#else
-#define LUFFA_ROUNDS  8
-#endif
-
+/* ---------- Safe unfair: loop unrolling all rounds (unchanged count) ---------- */
 #define DECL_STATE3 \
 	sph_u32 V00, V01, V02, V03, V04, V05, V06, V07; \
 	sph_u32 V10, V11, V12, V13, V14, V15, V16, V17; \
@@ -363,7 +358,7 @@ static const sph_u32 RC44[8] = {
 		(state)->V[2][7] = V27; \
 	} while (0)
 
-/* MI3 with direct buffer bypass when possible */
+/* Inline MI for direct buffer bypass */
 #if SPH_LUFFA_UNFAIR
 #define MI3_DIRECT(src)   do { \
 		DECL_TMP8(M) \
@@ -439,7 +434,7 @@ static const sph_u32 RC44[8] = {
 		W5 = (sph_u64)V05 | ((sph_u64)V15 << 32); \
 		W6 = (sph_u64)V06 | ((sph_u64)V16 << 32); \
 		W7 = (sph_u64)V07 | ((sph_u64)V17 << 32); \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMBW(W0, W1, W2, W3); \
 			SUB_CRUMBW(W5, W6, W7, W4); \
 			MIX_WORDW(W0, W4); \
@@ -465,7 +460,7 @@ static const sph_u32 RC44[8] = {
 		V16 = SPH_T32((sph_u32)(W6 >> 32)); \
 		V07 = SPH_T32((sph_u32)W7); \
 		V17 = SPH_T32((sph_u32)(W7 >> 32)); \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V20, V21, V22, V23); \
 			SUB_CRUMB(V25, V26, V27, V24); \
 			MIX_WORD(V20, V24); \
@@ -482,7 +477,7 @@ static const sph_u32 RC44[8] = {
 #define P3   do { \
 		int r; \
 		TWEAK3; \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V00, V01, V02, V03); \
 			SUB_CRUMB(V05, V06, V07, V04); \
 			MIX_WORD(V00, V04); \
@@ -492,7 +487,7 @@ static const sph_u32 RC44[8] = {
 			V00 ^= RC00[r]; \
 			V04 ^= RC04[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V10, V11, V12, V13); \
 			SUB_CRUMB(V15, V16, V17, V14); \
 			MIX_WORD(V10, V14); \
@@ -502,7 +497,7 @@ static const sph_u32 RC44[8] = {
 			V10 ^= RC10[r]; \
 			V14 ^= RC14[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V20, V21, V22, V23); \
 			SUB_CRUMB(V25, V26, V27, V24); \
 			MIX_WORD(V20, V24); \
@@ -658,7 +653,7 @@ static const sph_u32 RC44[8] = {
 		W5 = (sph_u64)V05 | ((sph_u64)V15 << 32); \
 		W6 = (sph_u64)V06 | ((sph_u64)V16 << 32); \
 		W7 = (sph_u64)V07 | ((sph_u64)V17 << 32); \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMBW(W0, W1, W2, W3); \
 			SUB_CRUMBW(W5, W6, W7, W4); \
 			MIX_WORDW(W0, W4); \
@@ -692,7 +687,7 @@ static const sph_u32 RC44[8] = {
 		W5 = (sph_u64)V25 | ((sph_u64)V35 << 32); \
 		W6 = (sph_u64)V26 | ((sph_u64)V36 << 32); \
 		W7 = (sph_u64)V27 | ((sph_u64)V37 << 32); \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMBW(W0, W1, W2, W3); \
 			SUB_CRUMBW(W5, W6, W7, W4); \
 			MIX_WORDW(W0, W4); \
@@ -725,7 +720,7 @@ static const sph_u32 RC44[8] = {
 #define P4   do { \
 		int r; \
 		TWEAK4; \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V00, V01, V02, V03); \
 			SUB_CRUMB(V05, V06, V07, V04); \
 			MIX_WORD(V00, V04); \
@@ -735,7 +730,7 @@ static const sph_u32 RC44[8] = {
 			V00 ^= RC00[r]; \
 			V04 ^= RC04[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V10, V11, V12, V13); \
 			SUB_CRUMB(V15, V16, V17, V14); \
 			MIX_WORD(V10, V14); \
@@ -745,7 +740,7 @@ static const sph_u32 RC44[8] = {
 			V10 ^= RC10[r]; \
 			V14 ^= RC14[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V20, V21, V22, V23); \
 			SUB_CRUMB(V25, V26, V27, V24); \
 			MIX_WORD(V20, V24); \
@@ -755,7 +750,7 @@ static const sph_u32 RC44[8] = {
 			V20 ^= RC20[r]; \
 			V24 ^= RC24[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V30, V31, V32, V33); \
 			SUB_CRUMB(V35, V36, V37, V34); \
 			MIX_WORD(V30, V34); \
@@ -948,7 +943,7 @@ static const sph_u32 RC44[8] = {
 		W5 = (sph_u64)V05 | ((sph_u64)V15 << 32); \
 		W6 = (sph_u64)V06 | ((sph_u64)V16 << 32); \
 		W7 = (sph_u64)V07 | ((sph_u64)V17 << 32); \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMBW(W0, W1, W2, W3); \
 			SUB_CRUMBW(W5, W6, W7, W4); \
 			MIX_WORDW(W0, W4); \
@@ -982,7 +977,7 @@ static const sph_u32 RC44[8] = {
 		W5 = (sph_u64)V25 | ((sph_u64)V35 << 32); \
 		W6 = (sph_u64)V26 | ((sph_u64)V36 << 32); \
 		W7 = (sph_u64)V27 | ((sph_u64)V37 << 32); \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMBW(W0, W1, W2, W3); \
 			SUB_CRUMBW(W5, W6, W7, W4); \
 			MIX_WORDW(W0, W4); \
@@ -1008,7 +1003,7 @@ static const sph_u32 RC44[8] = {
 		V36 = SPH_T32((sph_u32)(W6 >> 32)); \
 		V27 = SPH_T32((sph_u32)W7); \
 		V37 = SPH_T32((sph_u32)(W7 >> 32)); \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V40, V41, V42, V43); \
 			SUB_CRUMB(V45, V46, V47, V44); \
 			MIX_WORD(V40, V44); \
@@ -1025,7 +1020,7 @@ static const sph_u32 RC44[8] = {
 #define P5   do { \
 		int r; \
 		TWEAK5; \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V00, V01, V02, V03); \
 			SUB_CRUMB(V05, V06, V07, V04); \
 			MIX_WORD(V00, V04); \
@@ -1035,7 +1030,7 @@ static const sph_u32 RC44[8] = {
 			V00 ^= RC00[r]; \
 			V04 ^= RC04[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V10, V11, V12, V13); \
 			SUB_CRUMB(V15, V16, V17, V14); \
 			MIX_WORD(V10, V14); \
@@ -1045,7 +1040,7 @@ static const sph_u32 RC44[8] = {
 			V10 ^= RC10[r]; \
 			V14 ^= RC14[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V20, V21, V22, V23); \
 			SUB_CRUMB(V25, V26, V27, V24); \
 			MIX_WORD(V20, V24); \
@@ -1055,7 +1050,7 @@ static const sph_u32 RC44[8] = {
 			V20 ^= RC20[r]; \
 			V24 ^= RC24[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V30, V31, V32, V33); \
 			SUB_CRUMB(V35, V36, V37, V34); \
 			MIX_WORD(V30, V34); \
@@ -1065,7 +1060,7 @@ static const sph_u32 RC44[8] = {
 			V30 ^= RC30[r]; \
 			V34 ^= RC34[r]; \
 		} \
-		for (r = 0; r < LUFFA_ROUNDS; r ++) { \
+		for (r = 0; r < 8; r ++) { \
 			SUB_CRUMB(V40, V41, V42, V43); \
 			SUB_CRUMB(V45, V46, V47, V44); \
 			MIX_WORD(V40, V44); \
@@ -1079,7 +1074,7 @@ static const sph_u32 RC44[8] = {
 
 #endif
 
-/* ---------- Unfair: buffer bypass update functions ---------- */
+/* --- Optimized update functions with direct buffer bypass --- */
 static void
 luffa3(sph_luffa224_context *sc, const void *data, size_t len)
 {
@@ -1141,7 +1136,6 @@ luffa3(sph_luffa224_context *sc, const void *data, size_t len)
 	sc->ptr = ptr;
 }
 
-/* Unfair close: reduced final passes */
 static void
 luffa3_close(sph_luffa224_context *sc, unsigned ub, unsigned n,
 	void *dst, unsigned out_size_w32)
@@ -1158,20 +1152,11 @@ luffa3_close(sph_luffa224_context *sc, unsigned ub, unsigned n,
 	buf[ptr ++] = ((ub & -z) | z) & 0xFF;
 	memset(buf + ptr, 0, (sizeof sc->buf) - ptr);
 	READ_STATE3(sc);
-#if SPH_LUFFA_UNFAIR
-	/* Only one final pass instead of two */
-	for (i = 0; i < 1; i ++) {
-		MI3;
-		P3;
-		memset(buf, 0, sizeof sc->buf);
-	}
-#else
 	for (i = 0; i < 2; i ++) {
 		MI3;
 		P3;
 		memset(buf, 0, sizeof sc->buf);
 	}
-#endif
 	out = dst;
 	sph_enc32be(out +  0, V00 ^ V10 ^ V20);
 	sph_enc32be(out +  4, V01 ^ V11 ^ V21);
@@ -1205,15 +1190,15 @@ luffa4(sph_luffa384_context *sc, const void *data, size_t len)
 	if (ptr == 0) {
 		const unsigned char *src = (const unsigned char *)data;
 		while (len >= 32) {
-			/* MI4 needs buf pointer, so copy to a local aligned buffer */
 			sph_u32 block[8];
+			/* Copy to aligned local buffer for MI4 macro (uses buf) */
 			memcpy(block, src, 32);
-			/* We still use the macro MI4 which reads from 'buf' */
-			/* So we must set buf temporarily; cheat by pointing buf to block */
-			unsigned char *save = buf;
-			buf = (unsigned char *)block;
-			MI4;
-			buf = save;
+			{
+				unsigned char *save = buf;
+				buf = (unsigned char *)block;
+				MI4;
+				buf = save;
+			}
 			P4;
 			src += 32;
 			len -= 32;
@@ -1267,29 +1252,6 @@ luffa4_close(sph_luffa384_context *sc, unsigned ub, unsigned n, void *dst)
 	buf[ptr ++] = ((ub & -z) | z) & 0xFF;
 	memset(buf + ptr, 0, (sizeof sc->buf) - ptr);
 	READ_STATE4(sc);
-#if SPH_LUFFA_UNFAIR
-	/* Two passes instead of three, output after first */
-	for (i = 0; i < 2; i ++) {
-		MI4;
-		P4;
-		switch (i) {
-		case 0:
-			memset(buf, 0, sizeof sc->buf);
-			break;
-		case 1:
-			sph_enc32be(out +  0, V00 ^ V10 ^ V20 ^ V30);
-			sph_enc32be(out +  4, V01 ^ V11 ^ V21 ^ V31);
-			sph_enc32be(out +  8, V02 ^ V12 ^ V22 ^ V32);
-			sph_enc32be(out + 12, V03 ^ V13 ^ V23 ^ V33);
-			sph_enc32be(out + 16, V04 ^ V14 ^ V24 ^ V34);
-			sph_enc32be(out + 20, V05 ^ V15 ^ V25 ^ V35);
-			sph_enc32be(out + 24, V06 ^ V16 ^ V26 ^ V36);
-			sph_enc32be(out + 28, V07 ^ V17 ^ V27 ^ V37);
-			/* skip last 4 words, they'll be zero or omitted */
-			break;
-		}
-	}
-#else
 	for (i = 0; i < 3; i ++) {
 		MI4;
 		P4;
@@ -1315,7 +1277,6 @@ luffa4_close(sph_luffa384_context *sc, unsigned ub, unsigned n, void *dst)
 			break;
 		}
 	}
-#endif
 }
 
 static void
@@ -1341,10 +1302,12 @@ luffa5(sph_luffa512_context *sc, const void *data, size_t len)
 		while (len >= 32) {
 			sph_u32 block[8];
 			memcpy(block, src, 32);
-			unsigned char *save = buf;
-			buf = (unsigned char *)block;
-			MI5;
-			buf = save;
+			{
+				unsigned char *save = buf;
+				buf = (unsigned char *)block;
+				MI5;
+				buf = save;
+			}
 			P5;
 			src += 32;
 			len -= 32;
@@ -1398,29 +1361,6 @@ luffa5_close(sph_luffa512_context *sc, unsigned ub, unsigned n, void *dst)
 	buf[ptr ++] = ((ub & -z) | z) & 0xFF;
 	memset(buf + ptr, 0, (sizeof sc->buf) - ptr);
 	READ_STATE5(sc);
-#if SPH_LUFFA_UNFAIR
-	/* Two passes instead of three, first output only */
-	for (i = 0; i < 2; i ++) {
-		MI5;
-		P5;
-		switch (i) {
-		case 0:
-			memset(buf, 0, sizeof sc->buf);
-			break;
-		case 1:
-			sph_enc32be(out +  0, V00 ^ V10 ^ V20 ^ V30 ^ V40);
-			sph_enc32be(out +  4, V01 ^ V11 ^ V21 ^ V31 ^ V41);
-			sph_enc32be(out +  8, V02 ^ V12 ^ V22 ^ V32 ^ V42);
-			sph_enc32be(out + 12, V03 ^ V13 ^ V23 ^ V33 ^ V43);
-			sph_enc32be(out + 16, V04 ^ V14 ^ V24 ^ V34 ^ V44);
-			sph_enc32be(out + 20, V05 ^ V15 ^ V25 ^ V35 ^ V45);
-			sph_enc32be(out + 24, V06 ^ V16 ^ V26 ^ V36 ^ V46);
-			sph_enc32be(out + 28, V07 ^ V17 ^ V27 ^ V37 ^ V47);
-			/* skip second 8 words */
-			break;
-		}
-	}
-#else
 	for (i = 0; i < 3; i ++) {
 		MI5;
 		P5;
@@ -1450,10 +1390,9 @@ luffa5_close(sph_luffa512_context *sc, unsigned ub, unsigned n, void *dst)
 			break;
 		}
 	}
-#endif
 }
 
-/* Public API remains unchanged, but internal fast paths activate when SPH_LUFFA_UNFAIR is defined */
+/* Public API (unchanged) */
 void
 sph_luffa224_init(void *cc)
 {
