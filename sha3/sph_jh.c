@@ -100,20 +100,9 @@ extern "C"{
 
 #endif
 
-#define Sb(x0, x1, x2, x3, c)   do { \
-		x3 = ~x3; \
-		x0 ^= (c) & ~x2; \
-		tmp = (c) ^ (x0 & x1); \
-		x0 ^= x2 & x3; \
-		x3 ^= ~x1 & x2; \
-		x1 ^= x0 & x2; \
-		x2 ^= x0 & ~x3; \
-		x0 ^= x1 | x3; \
-		x3 ^= x1 & x2; \
-		x1 ^= tmp & x0; \
-		x2 ^= tmp; \
-	} while (0)
-
+/*
+ * Linear transform Lb – unchanged.
+ */
 #define Lb(x0, x1, x2, x3, x4, x5, x6, x7)   do { \
 		x4 ^= x1; \
 		x5 ^= x2; \
@@ -126,6 +115,26 @@ extern "C"{
 	} while (0)
 
 #if SPH_JH_64
+
+/*
+ * 64-bit S-box macro with LOCAL temporary – eliminates the 'tmp'
+ * cross-call dependency and allows both Sb calls in S() to execute
+ * independently.
+ */
+#define Sb(x0, x1, x2, x3, c)   do { \
+		sph_u64 Sb_tmp_; \
+		x3 = ~x3; \
+		x0 ^= (c) & ~x2; \
+		Sb_tmp_ = (c) ^ (x0 & x1); \
+		x0 ^= x2 & x3; \
+		x3 ^= ~x1 & x2; \
+		x1 ^= x0 & x2; \
+		x2 ^= x0 & ~x3; \
+		x0 ^= x1 | x3; \
+		x3 ^= x1 & x2; \
+		x1 ^= Sb_tmp_ & x0; \
+		x2 ^= Sb_tmp_; \
+	} while (0)
 
 static const sph_u64 C[] = {
 	C64e(0x72d5dea2df15f867), C64e(0x7b84150ab7231557),
@@ -252,8 +261,7 @@ static const sph_u64 C[] = {
 
 #define DECL_STATE \
 	sph_u64 h0h, h1h, h2h, h3h, h4h, h5h, h6h, h7h; \
-	sph_u64 h0l, h1l, h2l, h3l, h4l, h5l, h6l, h7l; \
-	sph_u64 tmp;
+	sph_u64 h0l, h1l, h2l, h3l, h4l, h5l, h6l, h7l;
 
 #define READ_STATE(state)   do { \
 		h0h = (state)->H.wide[ 0]; \
@@ -365,7 +373,25 @@ static const sph_u64 IV512[] = {
 	C64e(0xe3c2fcdfe68517fb), C64e(0x545a4678cc8cdd4b)
 };
 
-#else
+#else   /* 32-bit version */
+
+/*
+ * 32-bit S-box macro with LOCAL temporary.
+ */
+#define Sb(x0, x1, x2, x3, c)   do { \
+		sph_u32 Sb_tmp_; \
+		x3 = ~x3; \
+		x0 ^= (c) & ~x2; \
+		Sb_tmp_ = (c) ^ (x0 & x1); \
+		x0 ^= x2 & x3; \
+		x3 ^= ~x1 & x2; \
+		x1 ^= x0 & x2; \
+		x2 ^= x0 & ~x3; \
+		x0 ^= x1 | x3; \
+		x3 ^= x1 & x2; \
+		x1 ^= Sb_tmp_ & x0; \
+		x2 ^= Sb_tmp_; \
+	} while (0)
 
 static const sph_u32 C[] = {
 	C32e(0x72d5dea2), C32e(0xdf15f867), C32e(0x7b84150a),
@@ -546,8 +572,7 @@ static const sph_u32 C[] = {
 	sph_u32 h03, h02, h01, h00, h13, h12, h11, h10; \
 	sph_u32 h23, h22, h21, h20, h33, h32, h31, h30; \
 	sph_u32 h43, h42, h41, h40, h53, h52, h51, h50; \
-	sph_u32 h63, h62, h61, h60, h73, h72, h71, h70; \
-	sph_u32 tmp;
+	sph_u32 h63, h62, h61, h60, h73, h72, h71, h70;
 
 #define READ_STATE(state)   do { \
 		h03 = (state)->H.narrow[ 0]; \
@@ -715,11 +740,23 @@ static const sph_u32 IV512[] = {
 	C32e(0xe3c2fcdf), C32e(0xe68517fb), C32e(0x545a4678), C32e(0xcc8cdd4b)
 };
 
+#endif  /* SPH_JH_64 */
+
+/*
+ * Prefetch hint for the constant table – only active on GCC/Clang and
+ * only when not in small-footprint mode (unrolled E8 gives a compile-time
+ * constant r, so the condition is optimised away).
+ */
+#if defined(__GNUC__) && !defined(SPH_SMALL_FOOTPRINT_JH) && SPH_JH_64
+#define PREFETCH_CONST(r)   do { if ((r) < 41) __builtin_prefetch(&C[((r)+1)*4], 0, 3); } while(0)
+#else
+#define PREFETCH_CONST(r)   do {} while(0)
 #endif
 
 #define SL(ro)   SLu(r + ro, ro)
 
 #define SLu(r, ro)   do { \
+		PREFETCH_CONST(r); \
 		S(h0, h2, h4, h6, Ceven_, r); \
 		S(h1, h3, h5, h7, Codd_, r); \
 		L(h0, h2, h4, h6, h1, h3, h5, h7); \
@@ -922,6 +959,26 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 	}
 
 	READ_STATE(sc);
+
+	/* Fast path: when internal buffer is empty and at least one full
+	 * block is available, feed data directly without copying into sc->buf.
+	 */
+	while (len >= 64 && ptr == 0) {
+		buf = (unsigned char *)data;
+		INPUT_BUF1;
+		E8;
+		INPUT_BUF2;
+#if SPH_64
+		sc->block_count ++;
+#else
+		if ((sc->block_count_low = SPH_T32(sc->block_count_low + 1)) == 0)
+			sc->block_count_high ++;
+#endif
+		data = (const unsigned char *)data + 64;
+		len -= 64;
+	}
+	buf = sc->buf;   /* restore for normal copy path */
+
 	while (len > 0) {
 		size_t clen;
 
