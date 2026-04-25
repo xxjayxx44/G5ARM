@@ -115,7 +115,10 @@ extern "C"{
 #define B64_6(x)    (((x) >> 48) & 0xFF)
 #define B64_7(x)    ((x) >> 56)
 #define R64         SPH_ROTL64
+#define PC64(j, r)  ((sph_u64)((j) + (r)))
+#define QC64(j, r)  (((sph_u64)(r) << 56) ^ SPH_T64(~((sph_u64)(j) << 56)))
 #endif
+
 #else
 /* Big‑endian definitions (unchanged) */
 #define C32e(x)     SPH_C32(x)
@@ -147,6 +150,8 @@ extern "C"{
 #define B64_6(x)    (((x) >> 8) & 0xFF)
 #define B64_7(x)    ((x) & 0xFF)
 #define R64         SPH_ROTR64
+#define PC64(j, r)  ((sph_u64)((j) + (r)) << 56)
+#define QC64(j, r)  ((sph_u64)(r) ^ SPH_T64(~(sph_u64)(j)))
 #endif
 #endif
 
@@ -284,7 +289,6 @@ static const sph_u64 T0[] = {
 	C64e(0x6d0c61d661dad66d), C64e(0x2c624e3a4e583a2c)
 };
 
-/* T4 is the rotation set; used together with T0 */
 static const sph_u64 T4[] = {
 	C64e(0xf497a5c6c632f4a5), C64e(0x97eb84f8f86f9784),
 	C64e(0xb0c799eeee5eb099), C64e(0x8cf78df6f67a8c8d),
@@ -416,35 +420,6 @@ static const sph_u64 T4[] = {
 	C64e(0x61dad66d6d0c61d6), C64e(0x4e583a2c2c624e3a)
 };
 
-/* --------------------------------------------------------------- */
-/* Precomputed small‑state round constants (10 rounds, 8 words)    */
-/* --------------------------------------------------------------- */
-static const sph_u64 pc64_small_p[10][8] = {
-	/* round 0 */ { PC64(0x00,0), PC64(0x10,0), PC64(0x20,0), PC64(0x30,0), PC64(0x40,0), PC64(0x50,0), PC64(0x60,0), PC64(0x70,0) },
-	/* round 1 */ { PC64(0x00,1), PC64(0x10,1), PC64(0x20,1), PC64(0x30,1), PC64(0x40,1), PC64(0x50,1), PC64(0x60,1), PC64(0x70,1) },
-	/* round 2 */ { PC64(0x00,2), PC64(0x10,2), PC64(0x20,2), PC64(0x30,2), PC64(0x40,2), PC64(0x50,2), PC64(0x60,2), PC64(0x70,2) },
-	/* round 3 */ { PC64(0x00,3), PC64(0x10,3), PC64(0x20,3), PC64(0x30,3), PC64(0x40,3), PC64(0x50,3), PC64(0x60,3), PC64(0x70,3) },
-	/* round 4 */ { PC64(0x00,4), PC64(0x10,4), PC64(0x20,4), PC64(0x30,4), PC64(0x40,4), PC64(0x50,4), PC64(0x60,4), PC64(0x70,4) },
-	/* round 5 */ { PC64(0x00,5), PC64(0x10,5), PC64(0x20,5), PC64(0x30,5), PC64(0x40,5), PC64(0x50,5), PC64(0x60,5), PC64(0x70,5) },
-	/* round 6 */ { PC64(0x00,6), PC64(0x10,6), PC64(0x20,6), PC64(0x30,6), PC64(0x40,6), PC64(0x50,6), PC64(0x60,6), PC64(0x70,6) },
-	/* round 7 */ { PC64(0x00,7), PC64(0x10,7), PC64(0x20,7), PC64(0x30,7), PC64(0x40,7), PC64(0x50,7), PC64(0x60,7), PC64(0x70,7) },
-	/* round 8 */ { PC64(0x00,8), PC64(0x10,8), PC64(0x20,8), PC64(0x30,8), PC64(0x40,8), PC64(0x50,8), PC64(0x60,8), PC64(0x70,8) },
-	/* round 9 */ { PC64(0x00,9), PC64(0x10,9), PC64(0x20,9), PC64(0x30,9), PC64(0x40,9), PC64(0x50,9), PC64(0x60,9), PC64(0x70,9) }
-};
-
-static const sph_u64 qc64_small[10][8] = {
-	{ QC64(0x00,0), QC64(0x10,0), QC64(0x20,0), QC64(0x30,0), QC64(0x40,0), QC64(0x50,0), QC64(0x60,0), QC64(0x70,0) },
-	{ QC64(0x00,1), QC64(0x10,1), QC64(0x20,1), QC64(0x30,1), QC64(0x40,1), QC64(0x50,1), QC64(0x60,1), QC64(0x70,1) },
-	{ QC64(0x00,2), QC64(0x10,2), QC64(0x20,2), QC64(0x30,2), QC64(0x40,2), QC64(0x50,2), QC64(0x60,2), QC64(0x70,2) },
-	{ QC64(0x00,3), QC64(0x10,3), QC64(0x20,3), QC64(0x30,3), QC64(0x40,3), QC64(0x50,3), QC64(0x60,3), QC64(0x70,3) },
-	{ QC64(0x00,4), QC64(0x10,4), QC64(0x20,4), QC64(0x30,4), QC64(0x40,4), QC64(0x50,4), QC64(0x60,4), QC64(0x70,4) },
-	{ QC64(0x00,5), QC64(0x10,5), QC64(0x20,5), QC64(0x30,5), QC64(0x40,5), QC64(0x50,5), QC64(0x60,5), QC64(0x70,5) },
-	{ QC64(0x00,6), QC64(0x10,6), QC64(0x20,6), QC64(0x30,6), QC64(0x40,6), QC64(0x50,6), QC64(0x60,6), QC64(0x70,6) },
-	{ QC64(0x00,7), QC64(0x10,7), QC64(0x20,7), QC64(0x30,7), QC64(0x40,7), QC64(0x50,7), QC64(0x60,7), QC64(0x70,7) },
-	{ QC64(0x00,8), QC64(0x10,8), QC64(0x20,8), QC64(0x30,8), QC64(0x40,8), QC64(0x50,8), QC64(0x60,8), QC64(0x70,8) },
-	{ QC64(0x00,9), QC64(0x10,9), QC64(0x20,9), QC64(0x30,9), QC64(0x40,9), QC64(0x50,9), QC64(0x60,9), QC64(0x70,9) }
-};
-
 /* ---------- Small‑footprint RSTT (rotated T0/T4) ---------- */
 #define RSTT(d, a, b0, b1, b2, b3, b4, b5, b6, b7)   do { \
 		t[d] = T0[B64_0(a[b0])] \
@@ -457,17 +432,17 @@ static const sph_u64 qc64_small[10][8] = {
 			^ R64(T4[B64_7(a[b7])], 24); \
 	} while (0)
 
-/* Round macros with precomputed constants */
-#define ROUND_SMALL_P_CONST(a, r)   do { \
+/* Round macros that take r as parameter (compile‑time constant when unrolled) */
+#define ROUND_SMALL_P(a, r)   do { \
 		sph_u64 t[8]; \
-		a[0] ^= pc64_small_p[r][0]; \
-		a[1] ^= pc64_small_p[r][1]; \
-		a[2] ^= pc64_small_p[r][2]; \
-		a[3] ^= pc64_small_p[r][3]; \
-		a[4] ^= pc64_small_p[r][4]; \
-		a[5] ^= pc64_small_p[r][5]; \
-		a[6] ^= pc64_small_p[r][6]; \
-		a[7] ^= pc64_small_p[r][7]; \
+		a[0] ^= PC64(0x00, r); \
+		a[1] ^= PC64(0x10, r); \
+		a[2] ^= PC64(0x20, r); \
+		a[3] ^= PC64(0x30, r); \
+		a[4] ^= PC64(0x40, r); \
+		a[5] ^= PC64(0x50, r); \
+		a[6] ^= PC64(0x60, r); \
+		a[7] ^= PC64(0x70, r); \
 		RSTT(0, a, 0, 1, 2, 3, 4, 5, 6, 7); \
 		RSTT(1, a, 1, 2, 3, 4, 5, 6, 7, 0); \
 		RSTT(2, a, 2, 3, 4, 5, 6, 7, 0, 1); \
@@ -480,16 +455,16 @@ static const sph_u64 qc64_small[10][8] = {
 		a[4] = t[4]; a[5] = t[5]; a[6] = t[6]; a[7] = t[7]; \
 	} while (0)
 
-#define ROUND_SMALL_Q_CONST(a, r)   do { \
+#define ROUND_SMALL_Q(a, r)   do { \
 		sph_u64 t[8]; \
-		a[0] ^= qc64_small[r][0]; \
-		a[1] ^= qc64_small[r][1]; \
-		a[2] ^= qc64_small[r][2]; \
-		a[3] ^= qc64_small[r][3]; \
-		a[4] ^= qc64_small[r][4]; \
-		a[5] ^= qc64_small[r][5]; \
-		a[6] ^= qc64_small[r][6]; \
-		a[7] ^= qc64_small[r][7]; \
+		a[0] ^= QC64(0x00, r); \
+		a[1] ^= QC64(0x10, r); \
+		a[2] ^= QC64(0x20, r); \
+		a[3] ^= QC64(0x30, r); \
+		a[4] ^= QC64(0x40, r); \
+		a[5] ^= QC64(0x50, r); \
+		a[6] ^= QC64(0x60, r); \
+		a[7] ^= QC64(0x70, r); \
 		RSTT(0, a, 1, 3, 5, 7, 0, 2, 4, 6); \
 		RSTT(1, a, 2, 4, 6, 0, 1, 3, 5, 7); \
 		RSTT(2, a, 3, 5, 7, 1, 2, 4, 6, 0); \
@@ -502,31 +477,21 @@ static const sph_u64 qc64_small[10][8] = {
 		a[4] = t[4]; a[5] = t[5]; a[6] = t[6]; a[7] = t[7]; \
 	} while (0)
 
-/* Fully unrolled P/Q permutations (10 rounds) */
+/* Fully unrolled permutations */
 #define PERM_SMALL_P(a)   do { \
-		ROUND_SMALL_P_CONST(a, 0); \
-		ROUND_SMALL_P_CONST(a, 1); \
-		ROUND_SMALL_P_CONST(a, 2); \
-		ROUND_SMALL_P_CONST(a, 3); \
-		ROUND_SMALL_P_CONST(a, 4); \
-		ROUND_SMALL_P_CONST(a, 5); \
-		ROUND_SMALL_P_CONST(a, 6); \
-		ROUND_SMALL_P_CONST(a, 7); \
-		ROUND_SMALL_P_CONST(a, 8); \
-		ROUND_SMALL_P_CONST(a, 9); \
+		ROUND_SMALL_P(a, 0); ROUND_SMALL_P(a, 1); \
+		ROUND_SMALL_P(a, 2); ROUND_SMALL_P(a, 3); \
+		ROUND_SMALL_P(a, 4); ROUND_SMALL_P(a, 5); \
+		ROUND_SMALL_P(a, 6); ROUND_SMALL_P(a, 7); \
+		ROUND_SMALL_P(a, 8); ROUND_SMALL_P(a, 9); \
 	} while (0)
 
 #define PERM_SMALL_Q(a)   do { \
-		ROUND_SMALL_Q_CONST(a, 0); \
-		ROUND_SMALL_Q_CONST(a, 1); \
-		ROUND_SMALL_Q_CONST(a, 2); \
-		ROUND_SMALL_Q_CONST(a, 3); \
-		ROUND_SMALL_Q_CONST(a, 4); \
-		ROUND_SMALL_Q_CONST(a, 5); \
-		ROUND_SMALL_Q_CONST(a, 6); \
-		ROUND_SMALL_Q_CONST(a, 7); \
-		ROUND_SMALL_Q_CONST(a, 8); \
-		ROUND_SMALL_Q_CONST(a, 9); \
+		ROUND_SMALL_Q(a, 0); ROUND_SMALL_Q(a, 1); \
+		ROUND_SMALL_Q(a, 2); ROUND_SMALL_Q(a, 3); \
+		ROUND_SMALL_Q(a, 4); ROUND_SMALL_Q(a, 5); \
+		ROUND_SMALL_Q(a, 6); ROUND_SMALL_Q(a, 7); \
+		ROUND_SMALL_Q(a, 8); ROUND_SMALL_Q(a, 9); \
 	} while (0)
 
 /* State macros */
@@ -563,75 +528,8 @@ static const sph_u64 qc64_small[10][8] = {
 	} while (0)
 
 /* --------------------------------------------------------------- */
-/* Big‑state definitions (512‑bit permutation, 16 words)            */
-/* We follow the same pattern with precomputed constants for 14     */
-/* rounds. For brevity here we include the full big‑state code.     */
+/* Big‑state round macros (same approach, use r argument)           */
 /* --------------------------------------------------------------- */
-
-/* Precomputed big‑state P round constants (14 rounds, 16 words) */
-static const sph_u64 pc64_big_p[14][16] = {
-	{PC64(0x00,0),PC64(0x10,0),PC64(0x20,0),PC64(0x30,0),PC64(0x40,0),PC64(0x50,0),PC64(0x60,0),PC64(0x70,0),
-	 PC64(0x80,0),PC64(0x90,0),PC64(0xA0,0),PC64(0xB0,0),PC64(0xC0,0),PC64(0xD0,0),PC64(0xE0,0),PC64(0xF0,0)},
-	{PC64(0x00,1),PC64(0x10,1),PC64(0x20,1),PC64(0x30,1),PC64(0x40,1),PC64(0x50,1),PC64(0x60,1),PC64(0x70,1),
-	 PC64(0x80,1),PC64(0x90,1),PC64(0xA0,1),PC64(0xB0,1),PC64(0xC0,1),PC64(0xD0,1),PC64(0xE0,1),PC64(0xF0,1)},
-	{PC64(0x00,2),PC64(0x10,2),PC64(0x20,2),PC64(0x30,2),PC64(0x40,2),PC64(0x50,2),PC64(0x60,2),PC64(0x70,2),
-	 PC64(0x80,2),PC64(0x90,2),PC64(0xA0,2),PC64(0xB0,2),PC64(0xC0,2),PC64(0xD0,2),PC64(0xE0,2),PC64(0xF0,2)},
-	{PC64(0x00,3),PC64(0x10,3),PC64(0x20,3),PC64(0x30,3),PC64(0x40,3),PC64(0x50,3),PC64(0x60,3),PC64(0x70,3),
-	 PC64(0x80,3),PC64(0x90,3),PC64(0xA0,3),PC64(0xB0,3),PC64(0xC0,3),PC64(0xD0,3),PC64(0xE0,3),PC64(0xF0,3)},
-	{PC64(0x00,4),PC64(0x10,4),PC64(0x20,4),PC64(0x30,4),PC64(0x40,4),PC64(0x50,4),PC64(0x60,4),PC64(0x70,4),
-	 PC64(0x80,4),PC64(0x90,4),PC64(0xA0,4),PC64(0xB0,4),PC64(0xC0,4),PC64(0xD0,4),PC64(0xE0,4),PC64(0xF0,4)},
-	{PC64(0x00,5),PC64(0x10,5),PC64(0x20,5),PC64(0x30,5),PC64(0x40,5),PC64(0x50,5),PC64(0x60,5),PC64(0x70,5),
-	 PC64(0x80,5),PC64(0x90,5),PC64(0xA0,5),PC64(0xB0,5),PC64(0xC0,5),PC64(0xD0,5),PC64(0xE0,5),PC64(0xF0,5)},
-	{PC64(0x00,6),PC64(0x10,6),PC64(0x20,6),PC64(0x30,6),PC64(0x40,6),PC64(0x50,6),PC64(0x60,6),PC64(0x70,6),
-	 PC64(0x80,6),PC64(0x90,6),PC64(0xA0,6),PC64(0xB0,6),PC64(0xC0,6),PC64(0xD0,6),PC64(0xE0,6),PC64(0xF0,6)},
-	{PC64(0x00,7),PC64(0x10,7),PC64(0x20,7),PC64(0x30,7),PC64(0x40,7),PC64(0x50,7),PC64(0x60,7),PC64(0x70,7),
-	 PC64(0x80,7),PC64(0x90,7),PC64(0xA0,7),PC64(0xB0,7),PC64(0xC0,7),PC64(0xD0,7),PC64(0xE0,7),PC64(0xF0,7)},
-	{PC64(0x00,8),PC64(0x10,8),PC64(0x20,8),PC64(0x30,8),PC64(0x40,8),PC64(0x50,8),PC64(0x60,8),PC64(0x70,8),
-	 PC64(0x80,8),PC64(0x90,8),PC64(0xA0,8),PC64(0xB0,8),PC64(0xC0,8),PC64(0xD0,8),PC64(0xE0,8),PC64(0xF0,8)},
-	{PC64(0x00,9),PC64(0x10,9),PC64(0x20,9),PC64(0x30,9),PC64(0x40,9),PC64(0x50,9),PC64(0x60,9),PC64(0x70,9),
-	 PC64(0x80,9),PC64(0x90,9),PC64(0xA0,9),PC64(0xB0,9),PC64(0xC0,9),PC64(0xD0,9),PC64(0xE0,9),PC64(0xF0,9)},
-	{PC64(0x00,10),PC64(0x10,10),PC64(0x20,10),PC64(0x30,10),PC64(0x40,10),PC64(0x50,10),PC64(0x60,10),PC64(0x70,10),
-	 PC64(0x80,10),PC64(0x90,10),PC64(0xA0,10),PC64(0xB0,10),PC64(0xC0,10),PC64(0xD0,10),PC64(0xE0,10),PC64(0xF0,10)},
-	{PC64(0x00,11),PC64(0x10,11),PC64(0x20,11),PC64(0x30,11),PC64(0x40,11),PC64(0x50,11),PC64(0x60,11),PC64(0x70,11),
-	 PC64(0x80,11),PC64(0x90,11),PC64(0xA0,11),PC64(0xB0,11),PC64(0xC0,11),PC64(0xD0,11),PC64(0xE0,11),PC64(0xF0,11)},
-	{PC64(0x00,12),PC64(0x10,12),PC64(0x20,12),PC64(0x30,12),PC64(0x40,12),PC64(0x50,12),PC64(0x60,12),PC64(0x70,12),
-	 PC64(0x80,12),PC64(0x90,12),PC64(0xA0,12),PC64(0xB0,12),PC64(0xC0,12),PC64(0xD0,12),PC64(0xE0,12),PC64(0xF0,12)},
-	{PC64(0x00,13),PC64(0x10,13),PC64(0x20,13),PC64(0x30,13),PC64(0x40,13),PC64(0x50,13),PC64(0x60,13),PC64(0x70,13),
-	 PC64(0x80,13),PC64(0x90,13),PC64(0xA0,13),PC64(0xB0,13),PC64(0xC0,13),PC64(0xD0,13),PC64(0xE0,13),PC64(0xF0,13)}
-};
-
-static const sph_u64 qc64_big[14][16] = {
-	{QC64(0x00,0),QC64(0x10,0),QC64(0x20,0),QC64(0x30,0),QC64(0x40,0),QC64(0x50,0),QC64(0x60,0),QC64(0x70,0),
-	 QC64(0x80,0),QC64(0x90,0),QC64(0xA0,0),QC64(0xB0,0),QC64(0xC0,0),QC64(0xD0,0),QC64(0xE0,0),QC64(0xF0,0)},
-	{QC64(0x00,1),QC64(0x10,1),QC64(0x20,1),QC64(0x30,1),QC64(0x40,1),QC64(0x50,1),QC64(0x60,1),QC64(0x70,1),
-	 QC64(0x80,1),QC64(0x90,1),QC64(0xA0,1),QC64(0xB0,1),QC64(0xC0,1),QC64(0xD0,1),QC64(0xE0,1),QC64(0xF0,1)},
-	{QC64(0x00,2),QC64(0x10,2),QC64(0x20,2),QC64(0x30,2),QC64(0x40,2),QC64(0x50,2),QC64(0x60,2),QC64(0x70,2),
-	 QC64(0x80,2),QC64(0x90,2),QC64(0xA0,2),QC64(0xB0,2),QC64(0xC0,2),QC64(0xD0,2),QC64(0xE0,2),QC64(0xF0,2)},
-	{QC64(0x00,3),QC64(0x10,3),QC64(0x20,3),QC64(0x30,3),QC64(0x40,3),QC64(0x50,3),QC64(0x60,3),QC64(0x70,3),
-	 QC64(0x80,3),QC64(0x90,3),QC64(0xA0,3),QC64(0xB0,3),QC64(0xC0,3),QC64(0xD0,3),QC64(0xE0,3),QC64(0xF0,3)},
-	{QC64(0x00,4),QC64(0x10,4),QC64(0x20,4),QC64(0x30,4),QC64(0x40,4),QC64(0x50,4),QC64(0x60,4),QC64(0x70,4),
-	 QC64(0x80,4),QC64(0x90,4),QC64(0xA0,4),QC64(0xB0,4),QC64(0xC0,4),QC64(0xD0,4),QC64(0xE0,4),QC64(0xF0,4)},
-	{QC64(0x00,5),QC64(0x10,5),QC64(0x20,5),QC64(0x30,5),QC64(0x40,5),QC64(0x50,5),QC64(0x60,5),QC64(0x70,5),
-	 QC64(0x80,5),QC64(0x90,5),QC64(0xA0,5),QC64(0xB0,5),QC64(0xC0,5),QC64(0xD0,5),QC64(0xE0,5),QC64(0xF0,5)},
-	{QC64(0x00,6),QC64(0x10,6),QC64(0x20,6),QC64(0x30,6),QC64(0x40,6),QC64(0x50,6),QC64(0x60,6),QC64(0x70,6),
-	 QC64(0x80,6),QC64(0x90,6),QC64(0xA0,6),QC64(0xB0,6),QC64(0xC0,6),QC64(0xD0,6),QC64(0xE0,6),QC64(0xF0,6)},
-	{QC64(0x00,7),QC64(0x10,7),QC64(0x20,7),QC64(0x30,7),QC64(0x40,7),QC64(0x50,7),QC64(0x60,7),QC64(0x70,7),
-	 QC64(0x80,7),QC64(0x90,7),QC64(0xA0,7),QC64(0xB0,7),QC64(0xC0,7),QC64(0xD0,7),QC64(0xE0,7),QC64(0xF0,7)},
-	{QC64(0x00,8),QC64(0x10,8),QC64(0x20,8),QC64(0x30,8),QC64(0x40,8),QC64(0x50,8),QC64(0x60,8),QC64(0x70,8),
-	 QC64(0x80,8),QC64(0x90,8),QC64(0xA0,8),QC64(0xB0,8),QC64(0xC0,8),QC64(0xD0,8),QC64(0xE0,8),QC64(0xF0,8)},
-	{QC64(0x00,9),QC64(0x10,9),QC64(0x20,9),QC64(0x30,9),QC64(0x40,9),QC64(0x50,9),QC64(0x60,9),QC64(0x70,9),
-	 QC64(0x80,9),QC64(0x90,9),QC64(0xA0,9),QC64(0xB0,9),QC64(0xC0,9),QC64(0xD0,9),QC64(0xE0,9),QC64(0xF0,9)},
-	{QC64(0x00,10),QC64(0x10,10),QC64(0x20,10),QC64(0x30,10),QC64(0x40,10),QC64(0x50,10),QC64(0x60,10),QC64(0x70,10),
-	 QC64(0x80,10),QC64(0x90,10),QC64(0xA0,10),QC64(0xB0,10),QC64(0xC0,10),QC64(0xD0,10),QC64(0xE0,10),QC64(0xF0,10)},
-	{QC64(0x00,11),QC64(0x10,11),QC64(0x20,11),QC64(0x30,11),QC64(0x40,11),QC64(0x50,11),QC64(0x60,11),QC64(0x70,11),
-	 QC64(0x80,11),QC64(0x90,11),QC64(0xA0,11),QC64(0xB0,11),QC64(0xC0,11),QC64(0xD0,11),QC64(0xE0,11),QC64(0xF0,11)},
-	{QC64(0x00,12),QC64(0x10,12),QC64(0x20,12),QC64(0x30,12),QC64(0x40,12),QC64(0x50,12),QC64(0x60,12),QC64(0x70,12),
-	 QC64(0x80,12),QC64(0x90,12),QC64(0xA0,12),QC64(0xB0,12),QC64(0xC0,12),QC64(0xD0,12),QC64(0xE0,12),QC64(0xF0,12)},
-	{QC64(0x00,13),QC64(0x10,13),QC64(0x20,13),QC64(0x30,13),QC64(0x40,13),QC64(0x50,13),QC64(0x60,13),QC64(0x70,13),
-	 QC64(0x80,13),QC64(0x90,13),QC64(0xA0,13),QC64(0xB0,13),QC64(0xC0,13),QC64(0xD0,13),QC64(0xE0,13),QC64(0xF0,13)}
-};
-
-/* Big‑state small‑footprint RSTT (same T0/T4, using B64 macros) */
 #define RBTT(d, a, b0, b1, b2, b3, b4, b5, b6, b7)   do { \
 		t[d] = T0[B64_0(a[b0])] \
 			^ R64(T0[B64_1(a[b1])],  8) \
@@ -643,74 +541,80 @@ static const sph_u64 qc64_big[14][16] = {
 			^ R64(T4[B64_7(a[b7])], 24); \
 	} while (0)
 
-#define ROUND_BIG_P_CONST(a, r)   do { \
+#define ROUND_BIG_P(a, r)   do { \
 		sph_u64 t[16]; \
-		a[0] ^= pc64_big_p[r][0]; a[1] ^= pc64_big_p[r][1]; a[2] ^= pc64_big_p[r][2]; a[3] ^= pc64_big_p[r][3]; \
-		a[4] ^= pc64_big_p[r][4]; a[5] ^= pc64_big_p[r][5]; a[6] ^= pc64_big_p[r][6]; a[7] ^= pc64_big_p[r][7]; \
-		a[8] ^= pc64_big_p[r][8]; a[9] ^= pc64_big_p[r][9]; a[10] ^= pc64_big_p[r][10]; a[11] ^= pc64_big_p[r][11]; \
-		a[12] ^= pc64_big_p[r][12]; a[13] ^= pc64_big_p[r][13]; a[14] ^= pc64_big_p[r][14]; a[15] ^= pc64_big_p[r][15]; \
-		RBTT(0, a, 0, 1, 2, 3, 4, 5, 6, 11); \
-		RBTT(1, a, 1, 2, 3, 4, 5, 6, 7, 12); \
-		RBTT(2, a, 2, 3, 4, 5, 6, 7, 8, 13); \
-		RBTT(3, a, 3, 4, 5, 6, 7, 8, 9, 14); \
-		RBTT(4, a, 4, 5, 6, 7, 8, 9, 10, 15); \
-		RBTT(5, a, 5, 6, 7, 8, 9, 10, 11, 0); \
-		RBTT(6, a, 6, 7, 8, 9, 10, 11, 12, 1); \
-		RBTT(7, a, 7, 8, 9, 10, 11, 12, 13, 2); \
-		RBTT(8, a, 8, 9, 10, 11, 12, 13, 14, 3); \
-		RBTT(9, a, 9, 10, 11, 12, 13, 14, 15, 4); \
-		RBTT(10,a, 10,11,12,13,14,15,0, 5); \
-		RBTT(11,a, 11,12,13,14,15,0, 1, 6); \
-		RBTT(12,a, 12,13,14,15,0, 1, 2, 7); \
-		RBTT(13,a, 13,14,15,0, 1, 2, 3, 8); \
-		RBTT(14,a, 14,15,0, 1, 2, 3, 4, 9); \
-		RBTT(15,a, 15,0, 1, 2, 3, 4, 5, 10); \
-		memcpy(a, t, sizeof t); \
+		a[0x0] ^= PC64(0x00, r); a[0x1] ^= PC64(0x10, r); a[0x2] ^= PC64(0x20, r); a[0x3] ^= PC64(0x30, r); \
+		a[0x4] ^= PC64(0x40, r); a[0x5] ^= PC64(0x50, r); a[0x6] ^= PC64(0x60, r); a[0x7] ^= PC64(0x70, r); \
+		a[0x8] ^= PC64(0x80, r); a[0x9] ^= PC64(0x90, r); a[0xA] ^= PC64(0xA0, r); a[0xB] ^= PC64(0xB0, r); \
+		a[0xC] ^= PC64(0xC0, r); a[0xD] ^= PC64(0xD0, r); a[0xE] ^= PC64(0xE0, r); a[0xF] ^= PC64(0xF0, r); \
+		RBTT(0x0, a, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0xB); \
+		RBTT(0x1, a, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0xC); \
+		RBTT(0x2, a, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0xD); \
+		RBTT(0x3, a, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xE); \
+		RBTT(0x4, a, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xF); \
+		RBTT(0x5, a, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0x0); \
+		RBTT(0x6, a, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0x1); \
+		RBTT(0x7, a, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0x2); \
+		RBTT(0x8, a, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0x3); \
+		RBTT(0x9, a, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x4); \
+		RBTT(0xA, a, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x0, 0x5); \
+		RBTT(0xB, a, 0xB, 0xC, 0xD, 0xE, 0xF, 0x0, 0x1, 0x6); \
+		RBTT(0xC, a, 0xC, 0xD, 0xE, 0xF, 0x0, 0x1, 0x2, 0x7); \
+		RBTT(0xD, a, 0xD, 0xE, 0xF, 0x0, 0x1, 0x2, 0x3, 0x8); \
+		RBTT(0xE, a, 0xE, 0xF, 0x0, 0x1, 0x2, 0x3, 0x4, 0x9); \
+		RBTT(0xF, a, 0xF, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0xA); \
+		a[0x0] = t[0x0]; a[0x1] = t[0x1]; a[0x2] = t[0x2]; a[0x3] = t[0x3]; \
+		a[0x4] = t[0x4]; a[0x5] = t[0x5]; a[0x6] = t[0x6]; a[0x7] = t[0x7]; \
+		a[0x8] = t[0x8]; a[0x9] = t[0x9]; a[0xA] = t[0xA]; a[0xB] = t[0xB]; \
+		a[0xC] = t[0xC]; a[0xD] = t[0xD]; a[0xE] = t[0xE]; a[0xF] = t[0xF]; \
 	} while (0)
 
-#define ROUND_BIG_Q_CONST(a, r)   do { \
+#define ROUND_BIG_Q(a, r)   do { \
 		sph_u64 t[16]; \
-		a[0] ^= qc64_big[r][0]; a[1] ^= qc64_big[r][1]; a[2] ^= qc64_big[r][2]; a[3] ^= qc64_big[r][3]; \
-		a[4] ^= qc64_big[r][4]; a[5] ^= qc64_big[r][5]; a[6] ^= qc64_big[r][6]; a[7] ^= qc64_big[r][7]; \
-		a[8] ^= qc64_big[r][8]; a[9] ^= qc64_big[r][9]; a[10] ^= qc64_big[r][10]; a[11] ^= qc64_big[r][11]; \
-		a[12] ^= qc64_big[r][12]; a[13] ^= qc64_big[r][13]; a[14] ^= qc64_big[r][14]; a[15] ^= qc64_big[r][15]; \
-		RBTT(0, a, 1, 3, 5, 11, 0, 2, 4, 6); \
-		RBTT(1, a, 2, 4, 6, 12, 1, 3, 5, 7); \
-		RBTT(2, a, 3, 5, 7, 13, 2, 4, 6, 8); \
-		RBTT(3, a, 4, 6, 8, 14, 3, 5, 7, 9); \
-		RBTT(4, a, 5, 7, 9, 15, 4, 6, 8, 10); \
-		RBTT(5, a, 6, 8, 10, 0, 5, 7, 9, 11); \
-		RBTT(6, a, 7, 9, 11, 1, 6, 8, 10, 12); \
-		RBTT(7, a, 8, 10, 12, 2, 7, 9, 11, 13); \
-		RBTT(8, a, 9, 11, 13, 3, 8, 10, 12, 14); \
-		RBTT(9, a, 10,12,14,4, 9, 11,13,15); \
-		RBTT(10,a, 11,13,15,5, 10,12,14,0); \
-		RBTT(11,a, 12,14,0, 6, 11,13,15,1); \
-		RBTT(12,a, 13,15,1, 7, 12,14,0, 2); \
-		RBTT(13,a, 14,0, 2, 8, 13,15,1, 3); \
-		RBTT(14,a, 15,1, 3, 9, 14,0, 2, 4); \
-		RBTT(15,a, 0, 2, 4, 10,15,1, 3, 5); \
-		memcpy(a, t, sizeof t); \
+		a[0x0] ^= QC64(0x00, r); a[0x1] ^= QC64(0x10, r); a[0x2] ^= QC64(0x20, r); a[0x3] ^= QC64(0x30, r); \
+		a[0x4] ^= QC64(0x40, r); a[0x5] ^= QC64(0x50, r); a[0x6] ^= QC64(0x60, r); a[0x7] ^= QC64(0x70, r); \
+		a[0x8] ^= QC64(0x80, r); a[0x9] ^= QC64(0x90, r); a[0xA] ^= QC64(0xA0, r); a[0xB] ^= QC64(0xB0, r); \
+		a[0xC] ^= QC64(0xC0, r); a[0xD] ^= QC64(0xD0, r); a[0xE] ^= QC64(0xE0, r); a[0xF] ^= QC64(0xF0, r); \
+		RBTT(0x0, a, 0x1, 0x3, 0x5, 0xB, 0x0, 0x2, 0x4, 0x6); \
+		RBTT(0x1, a, 0x2, 0x4, 0x6, 0xC, 0x1, 0x3, 0x5, 0x7); \
+		RBTT(0x2, a, 0x3, 0x5, 0x7, 0xD, 0x2, 0x4, 0x6, 0x8); \
+		RBTT(0x3, a, 0x4, 0x6, 0x8, 0xE, 0x3, 0x5, 0x7, 0x9); \
+		RBTT(0x4, a, 0x5, 0x7, 0x9, 0xF, 0x4, 0x6, 0x8, 0xA); \
+		RBTT(0x5, a, 0x6, 0x8, 0xA, 0x0, 0x5, 0x7, 0x9, 0xB); \
+		RBTT(0x6, a, 0x7, 0x9, 0xB, 0x1, 0x6, 0x8, 0xA, 0xC); \
+		RBTT(0x7, a, 0x8, 0xA, 0xC, 0x2, 0x7, 0x9, 0xB, 0xD); \
+		RBTT(0x8, a, 0x9, 0xB, 0xD, 0x3, 0x8, 0xA, 0xC, 0xE); \
+		RBTT(0x9, a, 0xA, 0xC, 0xE, 0x4, 0x9, 0xB, 0xD, 0xF); \
+		RBTT(0xA, a, 0xB, 0xD, 0xF, 0x5, 0xA, 0xC, 0xE, 0x0); \
+		RBTT(0xB, a, 0xC, 0xE, 0x0, 0x6, 0xB, 0xD, 0xF, 0x1); \
+		RBTT(0xC, a, 0xD, 0xF, 0x1, 0x7, 0xC, 0xE, 0x0, 0x2); \
+		RBTT(0xD, a, 0xE, 0x0, 0x2, 0x8, 0xD, 0xF, 0x1, 0x3); \
+		RBTT(0xE, a, 0xF, 0x1, 0x3, 0x9, 0xE, 0x0, 0x2, 0x4); \
+		RBTT(0xF, a, 0x0, 0x2, 0x4, 0xA, 0xF, 0x1, 0x3, 0x5); \
+		a[0x0] = t[0x0]; a[0x1] = t[0x1]; a[0x2] = t[0x2]; a[0x3] = t[0x3]; \
+		a[0x4] = t[0x4]; a[0x5] = t[0x5]; a[0x6] = t[0x6]; a[0x7] = t[0x7]; \
+		a[0x8] = t[0x8]; a[0x9] = t[0x9]; a[0xA] = t[0xA]; a[0xB] = t[0xB]; \
+		a[0xC] = t[0xC]; a[0xD] = t[0xD]; a[0xE] = t[0xE]; a[0xF] = t[0xF]; \
 	} while (0)
 
 #define PERM_BIG_P(a)   do { \
-		ROUND_BIG_P_CONST(a, 0); ROUND_BIG_P_CONST(a, 1); \
-		ROUND_BIG_P_CONST(a, 2); ROUND_BIG_P_CONST(a, 3); \
-		ROUND_BIG_P_CONST(a, 4); ROUND_BIG_P_CONST(a, 5); \
-		ROUND_BIG_P_CONST(a, 6); ROUND_BIG_P_CONST(a, 7); \
-		ROUND_BIG_P_CONST(a, 8); ROUND_BIG_P_CONST(a, 9); \
-		ROUND_BIG_P_CONST(a, 10); ROUND_BIG_P_CONST(a, 11); \
-		ROUND_BIG_P_CONST(a, 12); ROUND_BIG_P_CONST(a, 13); \
+		ROUND_BIG_P(a, 0); ROUND_BIG_P(a, 1); \
+		ROUND_BIG_P(a, 2); ROUND_BIG_P(a, 3); \
+		ROUND_BIG_P(a, 4); ROUND_BIG_P(a, 5); \
+		ROUND_BIG_P(a, 6); ROUND_BIG_P(a, 7); \
+		ROUND_BIG_P(a, 8); ROUND_BIG_P(a, 9); \
+		ROUND_BIG_P(a, 10); ROUND_BIG_P(a, 11); \
+		ROUND_BIG_P(a, 12); ROUND_BIG_P(a, 13); \
 	} while (0)
 
 #define PERM_BIG_Q(a)   do { \
-		ROUND_BIG_Q_CONST(a, 0); ROUND_BIG_Q_CONST(a, 1); \
-		ROUND_BIG_Q_CONST(a, 2); ROUND_BIG_Q_CONST(a, 3); \
-		ROUND_BIG_Q_CONST(a, 4); ROUND_BIG_Q_CONST(a, 5); \
-		ROUND_BIG_Q_CONST(a, 6); ROUND_BIG_Q_CONST(a, 7); \
-		ROUND_BIG_Q_CONST(a, 8); ROUND_BIG_Q_CONST(a, 9); \
-		ROUND_BIG_Q_CONST(a, 10); ROUND_BIG_Q_CONST(a, 11); \
-		ROUND_BIG_Q_CONST(a, 12); ROUND_BIG_Q_CONST(a, 13); \
+		ROUND_BIG_Q(a, 0); ROUND_BIG_Q(a, 1); \
+		ROUND_BIG_Q(a, 2); ROUND_BIG_Q(a, 3); \
+		ROUND_BIG_Q(a, 4); ROUND_BIG_Q(a, 5); \
+		ROUND_BIG_Q(a, 6); ROUND_BIG_Q(a, 7); \
+		ROUND_BIG_Q(a, 8); ROUND_BIG_Q(a, 9); \
+		ROUND_BIG_Q(a, 10); ROUND_BIG_Q(a, 11); \
+		ROUND_BIG_Q(a, 12); ROUND_BIG_Q(a, 13); \
 	} while (0)
 
 #define DECL_STATE_BIG   sph_u64 H[16]
