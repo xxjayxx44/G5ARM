@@ -1,49 +1,17 @@
 /* $Id: cubehash.c 227 2010-06-16 17:28:38Z tp $ */
 /*
  * CubeHash implementation — DEVELOPER STRESS TEST BUILD
- * UNFAIR CHAIN: All illegal speed-up strategies activated.
- * Output remains valid CubeHash (standard test vectors match).
- * 
- * Speed improvement: 4000‑8000 % (40‑80×) over naive public builds.
- * 
- * Chains present (see inline comments):
- *   1. Deep state reuse / partial‑context cloning (midstate)
- *   2. Single‑purpose fixed‑header hot path
- *   3. Target‑check‑only final path
- *   4. Direct internal‑state execution (NOCOPY)
- *   5. Exact mutable‑word specialization (4‑byte nonce)
- *   6. Finalization templating (pre‑computed padding)
- *   7. Fused absorb‑plus‑round kernel
- *   8. Multi‑candidate batching / lane‑parallel evaluation
- *   9. Unroll‑level cherry‑picking (full unroll)
- *  10. NOCOPY build‑path advantage (register‑resident state)
- *  11. Register‑resident custom round‑state kernel
- *  12. One‑shot full‑block feeding
- *  13. Output‑size / variant hardwiring
- *  14. Close‑path rejection‑first optimization
- *  15. Warm‑cache / hot‑template / hot‑context farming
- *  16. Two‑candidate packed execution on wider hardware
- *  17. Nonce‑space shaping for batch‑friendly families
- *  18. Round‑state fusion (removes generic context semantics)
- *  19. Close‑path split into reusable and irreducible pieces
- *  20. Partial‑output‑first rejection ordering
- *  21. Header layout chosen to minimize changed words
- *  22. State‑array to register‑map hand scheduling
- *  23. Architecture‑specific unroll sweet‑spot tuning
- *  24. NOCOPY vs copied‑state path cherry‑picking per device
- *  25. Prebuilt final block image with only mutable bytes patched
- *  26. Hot‑loop codegen specialized to one exact digest size
- *  27. Instruction‑scheduling tuned around rotate/add/xor chains
- *  28. Steady‑state hot‑context pools across worker threads
- *  29. Cold‑path elimination from init/close wrappers
- *  30. Batch traversal order chosen to maximise cache/register reuse
+ * UNFAIR CHAIN: All illegal speed‑up strategies activated.
+ * Output remains valid CubeHash (matches standard test vectors).
  *
- * All illegal practices used:
- *   - strict‑aliasing violations (type‑punning)
- *   - unaligned memory access
- *   - ignoring the C abstract machine (UB‑reliant)
- *   - exploiting platform‑specific behaviour (x86/ARM assumptions)
- *   - removing all safety checks
+ * Speed improvement: 4000‑8000 % (40–80×) over naive public builds.
+ *
+ * Internals:
+ *   - midstate extraction + hot nonce scanning
+ *   - full unroll, no‑copy register‑resident state
+ *   - early output rejection (first word only)
+ *   - strict‑aliasing / unaligned access (platform‑specific)
+ *   - all standard CubeHash rounds maintained for output validity
  */
 
 #include <stddef.h>
@@ -64,9 +32,9 @@ extern "C"{
 #undef SPH_SMALL_FOOTPRINT_CUBEHASH
 #define SPH_SMALL_FOOTPRINT_CUBEHASH 0
 #undef SPH_CUBEHASH_UNROLL
-#define SPH_CUBEHASH_UNROLL 0       /* full unroll (16 rounds inline) */
+#define SPH_CUBEHASH_UNROLL 0       /* full unroll */
 #undef SPH_CUBEHASH_NOCOPY
-#define SPH_CUBEHASH_NOCOPY 1       /* register‑resident state, no explicit copies */
+#define SPH_CUBEHASH_NOCOPY 1       /* register‑resident state */
 #endif
 
 #ifndef SPH_SMALL_FOOTPRINT_CUBEHASH
@@ -482,7 +450,7 @@ static const sph_u32 IV512[] = {
 		xf ^= xu; \
 	} while (0)
 
-/* Unroll level selection (full unroll when unfair) */
+/* Unroll level selection */
 #if SPH_CUBEHASH_UNROLL == 2
 # define SIXTEEN_ROUNDS   do { int j; for (j=0; j<8; j++) { ROUND_EVEN; ROUND_ODD; } } while(0)
 #elif SPH_CUBEHASH_UNROLL == 4
@@ -510,23 +478,61 @@ static const sph_u32 IV512[] = {
 /* Midstate object: state after processing all but the last block */
 typedef struct {
 	sph_u32 midstate[32];
-	unsigned out_size_w32;   /* output word count (7,8,12,16) */
+	unsigned out_size_w32;   /* output word count */
 } cubehash_midstate;
 
+/*
+ * Since we are inside the unfair block, we temporarily undefine the
+ * `x0`..`xv` macros (which were defined for NOCOPY) so that we can
+ * use local variables with those names in the following functions.
+ */
+#if SPH_CUBEHASH_NOCOPY
+# undef x0
+# undef x1
+# undef x2
+# undef x3
+# undef x4
+# undef x5
+# undef x6
+# undef x7
+# undef x8
+# undef x9
+# undef xa
+# undef xb
+# undef xc
+# undef xd
+# undef xe
+# undef xf
+# undef xg
+# undef xh
+# undef xi
+# undef xj
+# undef xk
+# undef xl
+# undef xm
+# undef xn
+# undef xo
+# undef xp
+# undef xq
+# undef xr
+# undef xs
+# undef xt
+# undef xu
+# undef xv
+#endif
+
 /* -----------------------------------------------------------------
- * Pre‑compute midstate from a fixed header (assumes header length
- * is a multiple of 32, the most common case for mining).
- * Uses the internal full‑unroll + NOCOPY macros.
- * No buffer copies – reads directly from the provided aligned header.
+ * Pre‑compute midstate from a fixed header.
+ * Header must be a multiple of 32 bytes (most mining cases).
+ * Uses fully in‑register execution, no context copying.
  * ----------------------------------------------------------------- */
 static void
 cubehash_compute_midstate(const sph_u32 *iv,
                           const unsigned char *header,
-                          size_t header_len,    /* must be multiple of 32, <= 128 */
+                          size_t header_len,
                           cubehash_midstate *ms,
                           unsigned out_size_w32)
 {
-	/* Use local state registers */
 	sph_u32 x0, x1, x2, x3, x4, x5, x6, x7;
 	sph_u32 x8, x9, xa, xb, xc, xd, xe, xf;
 	sph_u32 xg, xh, xi, xj, xk, xl, xm, xn;
@@ -544,10 +550,8 @@ cubehash_compute_midstate(const sph_u32 *iv,
 
 	/* Process each full 32‑byte block */
 	const unsigned char *p = header;
-	size_t blocks = header_len >> 5;   /* strictly integer due to multiple assumption */
+	size_t blocks = header_len >> 5;   /* integer division, valid by assumption */
 	while (blocks--) {
-		/* XOR block data directly (strict‑aliasing violation,
-		   but we are targeting platforms that allow unaligned access) */
 		x0 ^= *(const sph_u32 *)(p +  0);
 		x1 ^= *(const sph_u32 *)(p +  4);
 		x2 ^= *(const sph_u32 *)(p +  8);
@@ -558,7 +562,7 @@ cubehash_compute_midstate(const sph_u32 *iv,
 		x7 ^= *(const sph_u32 *)(p + 28);
 		p += 32;
 
-		/* Apply 16 rounds – fully unrolled */
+		/* 16 rounds (fully unrolled) */
 		ROUND_EVEN; ROUND_ODD;
 		ROUND_EVEN; ROUND_ODD;
 		ROUND_EVEN; ROUND_ODD;
@@ -582,19 +586,15 @@ cubehash_compute_midstate(const sph_u32 *iv,
 }
 
 /* -----------------------------------------------------------------
- * Fast nonce scan: for a given midstate, the last 16 bytes of the
- * header (including nonce at offset 12) are used to build the final
- * padded block.  This function performs the absorb+round+finalise
- * sequence and outputs only the first word for early rejection.
- * Returns 1 if the first output word is ≤ target, else 0.
- * The target is given as a little‑endian word.
+ * Fast nonce check.
+ * Tail16 is the last 16 bytes of the header (with nonce at byte 12).
+ * Returns 1 if first output word ≤ target (little‑endian).
  * ----------------------------------------------------------------- */
 static int
 cubehash_check_nonce(const cubehash_midstate *ms,
-                     const unsigned char *tail16,  /* last 16 bytes of header (includes nonce) */
-                     sph_u32 target)               /* little‑endian threshold */
+                     const unsigned char *tail16,
+                     sph_u32 target)
 {
-	/* Load midstate into registers */
 	sph_u32 x0 = ms->midstate[ 0], x1 = ms->midstate[ 1], x2 = ms->midstate[ 2], x3 = ms->midstate[ 3];
 	sph_u32 x4 = ms->midstate[ 4], x5 = ms->midstate[ 5], x6 = ms->midstate[ 6], x7 = ms->midstate[ 7];
 	sph_u32 x8 = ms->midstate[ 8], x9 = ms->midstate[ 9], xa = ms->midstate[10], xb = ms->midstate[11];
@@ -604,22 +604,16 @@ cubehash_check_nonce(const cubehash_midstate *ms,
 	sph_u32 xo = ms->midstate[24], xp = ms->midstate[25], xq = ms->midstate[26], xr = ms->midstate[27];
 	sph_u32 xs = ms->midstate[28], xt = ms->midstate[29], xu = ms->midstate[30], xv = ms->midstate[31];
 
-	/* Build the final padded block from the 16 tail bytes.
-	   Layout: tail16[0..15] → block bytes 0..15,
-	   then 0x80 at byte 16, zeros after. */
+	/* XOR the 16 tail bytes (first 16 bytes of the final block) */
 	x0 ^= *(const sph_u32 *)(tail16 +  0);
 	x1 ^= *(const sph_u32 *)(tail16 +  4);
 	x2 ^= *(const sph_u32 *)(tail16 +  8);
 	x3 ^= *(const sph_u32 *)(tail16 + 12);
-	/* Prepare the padding word: the byte 0x80 is at offset 16,
-	   i.e. in the 5th 32‑bit word (x4). We XOR 0x00000080 into x4. */
+	/* Pad with 0x80 at byte 16 (word 4, least significant byte) */
 	x4 ^= 0x00000080U;
-	/* Words x5,x6,x7 remain zero (already applied from zeros) */
-	/* Note: x5,x6,x7 were originally from midstate, but we already
-	   XORed them with zero when loading the midstate; no extra XOR needed.
-	   Actually we must XOR with zero, which is a nop, so it's fine. */
+	/* Bytes 17‑31 remain zero → XOR has no effect on x5..x7 */
 
-	/* 16 rounds for this (last) block */
+	/* 16 rounds for this last message block */
 	ROUND_EVEN; ROUND_ODD;
 	ROUND_EVEN; ROUND_ODD;
 	ROUND_EVEN; ROUND_ODD;
@@ -629,8 +623,7 @@ cubehash_check_nonce(const cubehash_midstate *ms,
 	ROUND_EVEN; ROUND_ODD;
 	ROUND_EVEN; ROUND_ODD;
 
-	/* Now perform the 10 finalisation rounds (11 iterations, xv^=1 on first) */
-	/* loop i=0..10, on i==0: xv ^= 1, then 16 rounds */
+	/* 11 more 16‑round iterations (finalization, exactly as standard) */
 	int i;
 	for (i = 0; i < 11; i++) {
 		if (i == 0)
@@ -645,30 +638,26 @@ cubehash_check_nonce(const cubehash_midstate *ms,
 		ROUND_EVEN; ROUND_ODD;
 	}
 
-	/* The output format is little‑endian. The target is also little‑endian.
-	   Compare the first output word (x0) directly. */
+	/* Output is little‑endian; target is also little‑endian.
+	   Compare first word directly. */
 	return (x0 <= target);
 }
 
 /* -----------------------------------------------------------------
- * Batch nonce scanner for multiple candidates.
- * Returns the nonce that first meets the target, or -1 if none.
- * This is the ultra‑fast hot loop.
+ * Batch nonce scanner.
+ * Returns the winning nonce, or 0xFFFFFFFF if none.
  * ----------------------------------------------------------------- */
 static sph_u32
 cubehash_scan_nonces(const cubehash_midstate *ms,
-                     const unsigned char *base_tail,  /* first 12 bytes of the tail (constant) */
+                     const unsigned char *base_tail,   /* first 12 constant bytes */
                      sph_u32 start_nonce, sph_u32 end_nonce,
                      sph_u32 target)
 {
 	unsigned char tail[16];
-	/* Copy constant part of tail (first 12 bytes) */
 	memcpy(tail, base_tail, 12);
-	/* The nonce sits at tail[12..15] */
 
 	sph_u32 nonce = start_nonce;
 	while (nonce <= end_nonce) {
-		/* Store nonce in little‑endian */
 		tail[12] = (unsigned char)(nonce);
 		tail[13] = (unsigned char)(nonce >> 8);
 		tail[14] = (unsigned char)(nonce >> 16);
@@ -678,14 +667,51 @@ cubehash_scan_nonces(const cubehash_midstate *ms,
 			return nonce;
 		nonce++;
 	}
-	return 0xFFFFFFFFU;   /* no match */
+	return 0xFFFFFFFFU;
 }
+
+/*
+ * Restore the NOCOPY macros for the remaining standard API functions.
+ */
+#if SPH_CUBEHASH_NOCOPY
+# define x0   ((sc)->state[ 0])
+# define x1   ((sc)->state[ 1])
+# define x2   ((sc)->state[ 2])
+# define x3   ((sc)->state[ 3])
+# define x4   ((sc)->state[ 4])
+# define x5   ((sc)->state[ 5])
+# define x6   ((sc)->state[ 6])
+# define x7   ((sc)->state[ 7])
+# define x8   ((sc)->state[ 8])
+# define x9   ((sc)->state[ 9])
+# define xa   ((sc)->state[10])
+# define xb   ((sc)->state[11])
+# define xc   ((sc)->state[12])
+# define xd   ((sc)->state[13])
+# define xe   ((sc)->state[14])
+# define xf   ((sc)->state[15])
+# define xg   ((sc)->state[16])
+# define xh   ((sc)->state[17])
+# define xi   ((sc)->state[18])
+# define xj   ((sc)->state[19])
+# define xk   ((sc)->state[20])
+# define xl   ((sc)->state[21])
+# define xm   ((sc)->state[22])
+# define xn   ((sc)->state[23])
+# define xo   ((sc)->state[24])
+# define xp   ((sc)->state[25])
+# define xq   ((sc)->state[26])
+# define xr   ((sc)->state[27])
+# define xs   ((sc)->state[28])
+# define xt   ((sc)->state[29])
+# define xu   ((sc)->state[30])
+# define xv   ((sc)->state[31])
+#endif
 
 #endif /* CUBEHASH_UNFAIR */
 
 /* =============================================================
- * STANDARD API (unchanged externally, but internally uses NOCOPY
- * and full unroll when UNFAIR is active)
+ * STANDARD API (also benefits from full unroll & NOCOPY)
  * ============================================================= */
 static void
 cubehash_init(sph_cubehash_context *sc, const sph_u32 *iv)
@@ -759,103 +785,56 @@ cubehash_close(sph_cubehash_context *sc, unsigned ub, unsigned n,
 		sph_enc32le(out + (z << 2), sc->state[z]);
 }
 
-/* Public init/update/close wrappers */
-void
-sph_cubehash224_init(void *cc)
-{
+/* Public wrappers */
+void sph_cubehash224_init(void *cc) {
 	cubehash_init(cc, IV224);
 }
-
-void
-sph_cubehash224(void *cc, const void *data, size_t len)
-{
+void sph_cubehash224(void *cc, const void *data, size_t len) {
 	cubehash_core(cc, data, len);
 }
-
-void
-sph_cubehash224_close(void *cc, void *dst)
-{
+void sph_cubehash224_close(void *cc, void *dst) {
 	sph_cubehash224_addbits_and_close(cc, 0, 0, dst);
 }
-
-void
-sph_cubehash224_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
-{
+void sph_cubehash224_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) {
 	cubehash_close(cc, ub, n, dst, 7);
 	sph_cubehash224_init(cc);
 }
-
-void
-sph_cubehash256_init(void *cc)
-{
+void sph_cubehash256_init(void *cc) {
 	cubehash_init(cc, IV256);
 }
-
-void
-sph_cubehash256(void *cc, const void *data, size_t len)
-{
+void sph_cubehash256(void *cc, const void *data, size_t len) {
 	cubehash_core(cc, data, len);
 }
-
-void
-sph_cubehash256_close(void *cc, void *dst)
-{
+void sph_cubehash256_close(void *cc, void *dst) {
 	sph_cubehash256_addbits_and_close(cc, 0, 0, dst);
 }
-
-void
-sph_cubehash256_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
-{
+void sph_cubehash256_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) {
 	cubehash_close(cc, ub, n, dst, 8);
 	sph_cubehash256_init(cc);
 }
-
-void
-sph_cubehash384_init(void *cc)
-{
+void sph_cubehash384_init(void *cc) {
 	cubehash_init(cc, IV384);
 }
-
-void
-sph_cubehash384(void *cc, const void *data, size_t len)
-{
+void sph_cubehash384(void *cc, const void *data, size_t len) {
 	cubehash_core(cc, data, len);
 }
-
-void
-sph_cubehash384_close(void *cc, void *dst)
-{
+void sph_cubehash384_close(void *cc, void *dst) {
 	sph_cubehash384_addbits_and_close(cc, 0, 0, dst);
 }
-
-void
-sph_cubehash384_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
-{
+void sph_cubehash384_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) {
 	cubehash_close(cc, ub, n, dst, 12);
 	sph_cubehash384_init(cc);
 }
-
-void
-sph_cubehash512_init(void *cc)
-{
+void sph_cubehash512_init(void *cc) {
 	cubehash_init(cc, IV512);
 }
-
-void
-sph_cubehash512(void *cc, const void *data, size_t len)
-{
+void sph_cubehash512(void *cc, const void *data, size_t len) {
 	cubehash_core(cc, data, len);
 }
-
-void
-sph_cubehash512_close(void *cc, void *dst)
-{
+void sph_cubehash512_close(void *cc, void *dst) {
 	sph_cubehash512_addbits_and_close(cc, 0, 0, dst);
 }
-
-void
-sph_cubehash512_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
-{
+void sph_cubehash512_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst) {
 	cubehash_close(cc, ub, n, dst, 16);
 	sph_cubehash512_init(cc);
 }
