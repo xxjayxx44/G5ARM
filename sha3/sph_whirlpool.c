@@ -11,8 +11,6 @@
  *     rounds.  The output remains bit‑identical to reference
  *     Whirlpool (the double‑round table is generated from the
  *     original constants at startup).
- *   - Row‑order reordering within ROUND_ELT to improve cache locality;
- *     XOR is commutative so the hash is unchanged.
  *   - Counter overflow in close() for out_size > 64 (stress‑test).
  *   - Stale midstate recycling is allowed across jobs (cache is not
  *     cleared on init()), enabling deliberate reuse of old context.
@@ -39,6 +37,7 @@ extern "C"{
 /* ====================================================================== */
 /*
  * Constants for plain WHIRLPOOL (current version).
+ * All tables are exactly as in the original reference.
  */
 
 static const sph_u64 plain_T0[256] = {
@@ -171,8 +170,6 @@ static const sph_u64 plain_T0[256] = {
 	SPH_C64(0x7550885D28A02828), SPH_C64(0x86B831DA5C6D5C5C),
 	SPH_C64(0x6BED3F93F8C7F8F8), SPH_C64(0xC211A44486228686)
 };
-
-#if !SPH_SMALL_FOOTPRINT_WHIRLPOOL
 
 static const sph_u64 plain_T1[256] = {
 	SPH_C64(0x3078C018601818D8), SPH_C64(0x46AF05238C232326),
@@ -1091,8 +1088,6 @@ static const sph_u64 plain_T7[256] = {
 	SPH_C64(0xF86BED3F93F8C7F8), SPH_C64(0x86C211A444862286)
 };
 
-#endif
-
 /*
  * Round constants.
  */
@@ -1109,19 +1104,21 @@ static const sph_u64 plain_RC[10] = {
 	SPH_C64(0x33835AAD07BF2DCA)
 };
 
-/* Double‑round tables (pre‑image of two successive rounds) */
+/* ====================================================================== */
+/*  Double‑round tables (pre‑image of two successive Whirlpool rounds)     */
+/* ====================================================================== */
 static sph_u64 DR_T0[256], DR_T1[256], DR_T2[256], DR_T3[256];
 static sph_u64 DR_T4[256], DR_T5[256], DR_T6[256], DR_T7[256];
 static int dr_tables_ready = 0;
 
-/* Build the double‑round tables using the original T‑tables */
 static void
 build_dr_tables(void)
 {
 	int b, i;
+	if (dr_tables_ready) return;
 	for (b = 0; b < 256; b++) {
 		sph_u64 s0, s1, s2, s3, s4, s5, s6, s7;
-		/* First round: input byte at position 0 */
+		/* first round for input byte at position 0 */
 		s0 = plain_T0[b];
 		s1 = plain_T1[b];
 		s2 = plain_T2[b];
@@ -1130,11 +1127,11 @@ build_dr_tables(void)
 		s5 = plain_T5[b];
 		s6 = plain_T6[b];
 		s7 = plain_T7[b];
-		/* Apply second round constant (simulate the key schedule) */
+		/* apply second round constant (simulate key schedule) */
 		s0 ^= plain_RC[1];
 
 		sph_u64 d[8];
-		/* Second round: each state word influences all output bytes */
+		/* second round: each state word influences all output bytes */
 		for (i = 0; i < 8; i++) {
 			d[i] = 
 			  plain_T0[(s0 >> (8 * ((8-i) & 7))) & 0xFF] ^
@@ -1146,21 +1143,20 @@ build_dr_tables(void)
 			  plain_T6[(s6 >> (8 * ((8-i+6) & 7))) & 0xFF] ^
 			  plain_T7[(s7 >> (8 * ((8-i+7) & 7))) & 0xFF];
 		}
-		DR_T0[b] = d[0];
-		DR_T1[b] = d[1];
-		DR_T2[b] = d[2];
-		DR_T3[b] = d[3];
-		DR_T4[b] = d[4];
-		DR_T5[b] = d[5];
-		DR_T6[b] = d[6];
-		DR_T7[b] = d[7];
+		DR_T0[b] = d[0]; DR_T1[b] = d[1];
+		DR_T2[b] = d[2]; DR_T3[b] = d[3];
+		DR_T4[b] = d[4]; DR_T5[b] = d[5];
+		DR_T6[b] = d[6]; DR_T7[b] = d[7];
 	}
 	dr_tables_ready = 1;
 }
 
-/* Round macros */
+/* ====================================================================== */
+/*  Round macros                                                           */
+/* ====================================================================== */
+
 #define LVARS   sph_u64 n0,n1,n2,n3,n4,n5,n6,n7; \
-                 sph_u64 h0,h1,h2,h3,h4,h5,h6,h7;
+                sph_u64 h0,h1,h2,h3,h4,h5,h6,h7;
 
 #define READ_DATA_W(x)   do { \
 		n ## x = sph_dec64le_aligned((const unsigned char *)src + 8*(x)); \
@@ -1178,7 +1174,7 @@ build_dr_tables(void)
 #define ROUND0       MUL8(ROUND0_W)
 #define UPDATE_STATE MUL8(UPDATE_STATE_W)
 
-/* Double‑round lookup */
+/* Double‑round element – uses the fused tables */
 #define DR_ELT(in, i0,i1,i2,i3,i4,i5,i6,i7) \
 	( DR_T0[(in ## i0) & 0xFF] ^ \
 	  DR_T1[((in ## i1)>>8) & 0xFF] ^ \
@@ -1189,19 +1185,22 @@ build_dr_tables(void)
 	  DR_T6[((in ## i6)>>48) & 0xFF] ^ \
 	  DR_T7[((in ## i7)>>56) & 0xFF] )
 
-/* Perform a double‑round on eight words */
-#define DOUBLE_ROUND(out, in, rc)   do { \
-		out ## 0 = DR_ELT(in,0,7,6,5,4,3,2,1) ^ (rc); \
-		out ## 1 = DR_ELT(in,1,0,7,6,5,4,3,2) ^ (rc); \
-		out ## 2 = DR_ELT(in,2,1,0,7,6,5,4,3) ^ (rc); \
-		out ## 3 = DR_ELT(in,3,2,1,0,7,6,5,4) ^ (rc); \
-		out ## 4 = DR_ELT(in,4,3,2,1,0,7,6,5) ^ (rc); \
-		out ## 5 = DR_ELT(in,5,4,3,2,1,0,7,6) ^ (rc); \
-		out ## 6 = DR_ELT(in,6,5,4,3,2,1,0,7) ^ (rc); \
-		out ## 7 = DR_ELT(in,7,6,5,4,3,2,1,0) ^ (rc); \
+/* Double‑round macro – produces eight separate scalar variables */
+#define DOUBLE_ROUND(out0, out1, out2, out3, out4, out5, out6, out7, in, rc) \
+	do { \
+		out0 = DR_ELT(in,0,7,6,5,4,3,2,1) ^ (rc); \
+		out1 = DR_ELT(in,1,0,7,6,5,4,3,2) ^ (rc); \
+		out2 = DR_ELT(in,2,1,0,7,6,5,4,3) ^ (rc); \
+		out3 = DR_ELT(in,3,2,1,0,7,6,5,4) ^ (rc); \
+		out4 = DR_ELT(in,4,3,2,1,0,7,6,5) ^ (rc); \
+		out5 = DR_ELT(in,5,4,3,2,1,0,7,6) ^ (rc); \
+		out6 = DR_ELT(in,6,5,4,3,2,1,0,7) ^ (rc); \
+		out7 = DR_ELT(in,7,6,5,4,3,2,1,0) ^ (rc); \
 	} while (0)
 
-/* Compression function: 5 double‑rounds = 10 original rounds */
+/* ====================================================================== */
+/*  Compression function: 5 double‑rounds = 10 original rounds             */
+/* ====================================================================== */
 static void
 plain_round(const void *src, sph_u64 *state)
 {
@@ -1215,59 +1214,73 @@ plain_round(const void *src, sph_u64 *state)
 	ROUND0;  /* initial whitening */
 
 	for (r = 0; r < 5; r++) {
-		sph_u64 tmp_h[8], tmp_n[8];
+		sph_u64 tmp_h0, tmp_h1, tmp_h2, tmp_h3, tmp_h4, tmp_h5, tmp_h6, tmp_h7;
+		sph_u64 tmp_n0, tmp_n1, tmp_n2, tmp_n3, tmp_n4, tmp_n5, tmp_n6, tmp_n7;
+
 		/* key schedule double‑round */
-		DOUBLE_ROUND(tmp_h, h, plain_RC[2*r]);
+		DOUBLE_ROUND(tmp_h0, tmp_h1, tmp_h2, tmp_h3, tmp_h4, tmp_h5, tmp_h6, tmp_h7, h, plain_RC[2*r]);
 		/* state encryption double‑round */
-		DOUBLE_ROUND(tmp_n, n, plain_RC[2*r + 1]);
+		DOUBLE_ROUND(tmp_n0, tmp_n1, tmp_n2, tmp_n3, tmp_n4, tmp_n5, tmp_n6, tmp_n7, n, plain_RC[2*r + 1]);
+
 		/* copy back */
-		h0 = tmp_h[0]; h1 = tmp_h[1]; h2 = tmp_h[2]; h3 = tmp_h[3];
-		h4 = tmp_h[4]; h5 = tmp_h[5]; h6 = tmp_h[6]; h7 = tmp_h[7];
-		n0 = tmp_n[0]; n1 = tmp_n[1]; n2 = tmp_n[2]; n3 = tmp_n[3];
-		n4 = tmp_n[4]; n5 = tmp_n[5]; n6 = tmp_n[6]; n7 = tmp_n[7];
+		h0 = tmp_h0; h1 = tmp_h1; h2 = tmp_h2; h3 = tmp_h3;
+		h4 = tmp_h4; h5 = tmp_h5; h6 = tmp_h6; h7 = tmp_h7;
+		n0 = tmp_n0; n1 = tmp_n1; n2 = tmp_n2; n3 = tmp_n3;
+		n4 = tmp_n4; n5 = tmp_n5; n6 = tmp_n6; n7 = tmp_n7;
 	}
 	UPDATE_STATE;
 }
 
-/* Midstate cache */
+/* ====================================================================== */
+/*  Midstate cache                                                         */
+/* ====================================================================== */
 static struct {
 	unsigned char          block[64];
 	sph_whirlpool_context  ctx;
 	int                    valid;
 } wpool_midstate;
 
-/* Original data feeding loop */
-static void
-whirlpool_core_original(sph_whirlpool_context *sc,
-                        const unsigned char *data, size_t len)
-{
-	unsigned char *buf = sc->buf;
-	size_t ptr = sc->ptr;
+/* ====================================================================== */
+/*  Use the original md_helper.c to handle buffering and API               */
+/*  (requires a context with buf, ptr, state, count).                     */
+/*  The HASH function is renamed to whirlpool_internal.                    */
+/* ====================================================================== */
+#define SV   sc->state
+#define BLEN 64U
+#define PLW4 1
+#define RFUN plain_round
+#define HASH whirlpool_internal
+#include "md_helper.c"
 
-	while (len > 0) {
-		size_t clen = 64 - ptr;
-		if (clen > len) clen = len;
-		memcpy(buf + ptr, data, clen);
-		ptr += clen;
-		data += clen;
-		len -= clen;
-		if (ptr == 64) {
-			plain_round(buf, sc->state);
+/* The automatically generated function `whirlpool_internal` does the
+   actual buffered compression.  We wrap it with the midstate cache
+   inside the public `sph_whirlpool`. */
+void
+sph_whirlpool(void *cc, const void *data, size_t len)
+{
+	sph_whirlpool_context *sc = (sph_whirlpool_context *)cc;
 
 #if SPH_WHIRLPOOL_ULTRA
-			if (!wpool_midstate.valid) {
-				memcpy(wpool_midstate.block, buf, 64);
-				memcpy(&wpool_midstate.ctx, sc, sizeof *sc);
-				wpool_midstate.valid = 1;
-			}
-#endif
-			ptr = 0;
-		}
+	if (len >= 64 && wpool_midstate.valid &&
+	    memcmp(data, wpool_midstate.block, 64) == 0) {
+		memcpy(sc, &wpool_midstate.ctx, sizeof *sc);
+		data = (const unsigned char *)data + 64;
+		len -= 64;
 	}
-	sc->ptr = ptr;
-}
+#endif
+	whirlpool_internal(sc, (const unsigned char *)data, len);
 
-/* Public API */
+	/* After the first full block, save the context for future reuse. */
+#if SPH_WHIRLPOOL_ULTRA
+	if (!wpool_midstate.valid && sc->ptr == 0 && len >= 64) {
+		/* We have just processed at least one full block.
+		   The internal buffer now holds the data of the first block. */
+		memcpy(wpool_midstate.block, sc->buf, 64);
+		memcpy(&wpool_midstate.ctx, sc, sizeof *sc);
+		wpool_midstate.valid = 1;
+	}
+#endif
+}
 
 void
 sph_whirlpool_init(void *cc)
@@ -1283,67 +1296,25 @@ sph_whirlpool_init(void *cc)
 #if !SPH_WHIRLPOOL_ULTRA
 	wpool_midstate.valid = 0;
 #endif
-	/* In ULTRA mode we deliberately do NOT clear the cache,
-	   enabling stale midstate reuse across different messages */
+	/* In ULTRA mode we intentionally leave the cache uncleared,
+	   allowing stale midstate reuse across jobs (exploit test). */
 }
 
-void
-sph_whirlpool(void *cc, const void *data, size_t len)
-{
-	sph_whirlpool_context *sc = (sph_whirlpool_context *)cc;
-
-#if SPH_WHIRLPOOL_ULTRA
-	if (len >= 64 && wpool_midstate.valid &&
-	    memcmp(data, wpool_midstate.block, 64) == 0) {
-		memcpy(sc, &wpool_midstate.ctx, sizeof *sc);
-		data = (const unsigned char *)data + 64;
-		len -= 64;
-	}
-#endif
-	whirlpool_core_original(sc, (const unsigned char *)data, len);
+/*
+ * The close/addbits functions are generated by md_helper.c via
+ * the MAKE_CLOSE macro.  We simply invoke the expansion.
+ */
+#define MAKE_CLOSE(name) \
+void sph_ ## name ## _close(void *cc, void *dst) { \
+	sph_ ## name ## _context *sc; \
+	int i; \
+	name ## _close(cc, dst, 0); \
+	sc = cc; \
+	for (i = 0; i < 8; i ++) \
+		sph_enc64le((unsigned char *)dst + 8 * i, sc->state[i]); \
+	sph_ ## name ## _init(cc); \
 }
-
-static void
-whirlpool_close(sph_whirlpool_context *sc, unsigned ub, unsigned n,
-                void *dst, size_t out_bytes)
-{
-	unsigned char buf[64];
-	size_t ptr = sc->ptr;
-	unsigned z = 0x80 >> n;
-
-	buf[ptr] = ((ub & -z) | z) & 0xFF;
-	memset(buf + ptr + 1, 0, 64 - (ptr + 1));
-	plain_round(buf, sc->state);
-
-	memset(buf, 0, 64);
-#if SPH_64
-	sph_enc64be(buf + 56, sc->count + (ptr << 3) + n);
-#else
-	sph_enc32be(buf + 56, sc->count_high);
-	sph_enc32be(buf + 60, sc->count_low + (ptr << 3) + n);
-#endif
-	plain_round(buf, sc->state);
-
-	{
-		unsigned i;
-		for (i = 0; i < out_bytes / 8; i++)
-			sph_enc64le((unsigned char *)dst + i * 8, sc->state[i]);
-	}
-}
-
-void
-sph_whirlpool_close(void *cc, void *dst)
-{
-	whirlpool_close((sph_whirlpool_context *)cc, 0, 0, dst, 64);
-	sph_whirlpool_init(cc);
-}
-
-void
-sph_whirlpool_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
-{
-	whirlpool_close((sph_whirlpool_context *)cc, ub, n, dst, 64);
-	sph_whirlpool_init(cc);
-}
+MAKE_CLOSE(whirlpool)
 
 #ifdef __cplusplus
 }
