@@ -3,10 +3,15 @@
  * WHIRLPOOL implementation – ULTRA variant with midstate cache,
  * 3‑table reduction, and round‑fusion stubs.
  *
- * This implementation produces correct standard WHIRLPOOL digests
+ * This implementation produces **correct standard WHIRLPOOL digests**
  * while keeping the requested ULTRA modifications: midstate reuse,
  * reduced table count (only T0, T1, T2), and placeholders for
  * future round‑reduction acceleration.
+ *
+ * Tables T3 … T7 are generated on‑the‑fly from T0 using byte‑rotations
+ * (SPH_ROTL64). This saves 5 × 2048 = 10 KiB of code memory while
+ * preserving the exact same mathematical output as the reference
+ * implementation.
  */
 
 #define SPH_WHIRLPOOL_ULTRA 1
@@ -441,15 +446,9 @@ static const sph_u64 plain_RC[10] = {
 
 /* ====================================================================== */
 /*  Helper macros for the 3‑table scheme                                   */
+/*  byte‑rotate T0 to obtain T3 .. T7.  Identical to the data that would
+    be stored in separate tables.                                         */
 /* ====================================================================== */
-#define ROL8(x)  (((x) <<  8) | ((x) >> 56))
-#define ROL16(x) (((x) << 16) | ((x) >> 48))
-#define ROL24(x) (((x) << 24) | ((x) >> 40))
-#define ROL32(x) (((x) << 32) | ((x) >> 32))
-#define ROL40(x) (((x) << 40) | ((x) >> 24))
-#define ROL48(x) (((x) << 48) | ((x) >> 16))
-#define ROL56(x) (((x) << 56) | ((x) >>  8))
-
 static inline sph_u64
 table33(int idx, unsigned b)
 {
@@ -458,114 +457,104 @@ table33(int idx, unsigned b)
 	case 0: return v;
 	case 1: return plain_T1[b];
 	case 2: return plain_T2[b];
-	case 3: return ROL24(v);
-	case 4: return ROL32(v);
-	case 5: return ROL40(v);
-	case 6: return ROL48(v);
-	case 7: return ROL56(v);
+	case 3: return SPH_ROTL64(v, 24);
+	case 4: return SPH_ROTL64(v, 32);
+	case 5: return SPH_ROTL64(v, 40);
+	case 6: return SPH_ROTL64(v, 48);
+	case 7: return SPH_ROTL64(v, 56);
 	default: return 0;
 	}
 }
 
 /* ====================================================================== */
-/*  Standard 10‑round compression (produces correct Whirlpool output)     */
+/*  Standard macros (taken from original code)                             */
 /* ====================================================================== */
+#define DECL8(z)   sph_u64 z ## 0, z ## 1, z ## 2, z ## 3, \
+                   z ## 4, z ## 5, z ## 6, z ## 7
+
+#define BYTE(x, n)     ((unsigned)((x) >> (8 * (n))) & 0xFF)
+
+#define ROUND_ELT(in, i0,i1,i2,i3,i4,i5,i6,i7) \
+	(table33(0, BYTE(in ## i0, 0)) \
+	^ table33(1, BYTE(in ## i1, 1)) \
+	^ table33(2, BYTE(in ## i2, 2)) \
+	^ table33(3, BYTE(in ## i3, 3)) \
+	^ table33(4, BYTE(in ## i4, 4)) \
+	^ table33(5, BYTE(in ## i5, 5)) \
+	^ table33(6, BYTE(in ## i6, 6)) \
+	^ table33(7, BYTE(in ## i7, 7)))
+
+#define ROUND_KSCHED(in, out, c)   do { \
+		out ## 0 = ROUND_ELT(in, 0,7,6,5,4,3,2,1) ^ c; \
+		out ## 1 = ROUND_ELT(in, 1,0,7,6,5,4,3,2); \
+		out ## 2 = ROUND_ELT(in, 2,1,0,7,6,5,4,3); \
+		out ## 3 = ROUND_ELT(in, 3,2,1,0,7,6,5,4); \
+		out ## 4 = ROUND_ELT(in, 4,3,2,1,0,7,6,5); \
+		out ## 5 = ROUND_ELT(in, 5,4,3,2,1,0,7,6); \
+		out ## 6 = ROUND_ELT(in, 6,5,4,3,2,1,0,7); \
+		out ## 7 = ROUND_ELT(in, 7,6,5,4,3,2,1,0); \
+	} while (0)
+
+#define ROUND_WENC(in, key, out)   do { \
+		out ## 0 = ROUND_ELT(in, 0,7,6,5,4,3,2,1) ^ key ## 0; \
+		out ## 1 = ROUND_ELT(in, 1,0,7,6,5,4,3,2) ^ key ## 1; \
+		out ## 2 = ROUND_ELT(in, 2,1,0,7,6,5,4,3) ^ key ## 2; \
+		out ## 3 = ROUND_ELT(in, 3,2,1,0,7,6,5,4) ^ key ## 3; \
+		out ## 4 = ROUND_ELT(in, 4,3,2,1,0,7,6,5) ^ key ## 4; \
+		out ## 5 = ROUND_ELT(in, 5,4,3,2,1,0,7,6) ^ key ## 5; \
+		out ## 6 = ROUND_ELT(in, 6,5,4,3,2,1,0,7) ^ key ## 6; \
+		out ## 7 = ROUND_ELT(in, 7,6,5,4,3,2,1,0) ^ key ## 7; \
+	} while (0)
+
+#define TRANSFER(dst, src)   do { \
+		dst ## 0 = src ## 0; dst ## 1 = src ## 1; \
+		dst ## 2 = src ## 2; dst ## 3 = src ## 3; \
+		dst ## 4 = src ## 4; dst ## 5 = src ## 5; \
+		dst ## 6 = src ## 6; dst ## 7 = src ## 7; \
+	} while (0)
+
+/* ====================================================================== */
+/*  Main compression function                                              */
+/* ====================================================================== */
+#define READ_DATA_W(x)   do { \
+		n ## x = sph_dec64le_aligned((const unsigned char *)src + 8*(x)); \
+	} while (0)
+#define UPDATE_STATE_W(x)   do { \
+		state[x] ^= n ## x ^ sph_dec64le_aligned((const unsigned char *)src + 8*(x)); \
+	} while (0)
+#define READ_STATE_W(x)   do { h ## x = state[x]; } while (0)
+
+#define MUL8(FUN)   do { \
+		FUN(0);FUN(1);FUN(2);FUN(3);FUN(4);FUN(5);FUN(6);FUN(7); \
+	} while (0)
+
+#define READ_DATA      MUL8(READ_DATA_W)
+#define READ_STATE     MUL8(READ_STATE_W)
+#define UPDATE_STATE   MUL8(UPDATE_STATE_W)
+#define ROUND0_W(x)   do { n ## x ^= h ## x; } while (0)
+#define ROUND0         MUL8(ROUND0_W)
+
 static void
 whirlpool_compress(const void *src, sph_u64 *state)
 {
-	int i, r;
-	sph_u64 K[8], L[8];
+	int r;
+	DECL8(n); DECL8(h);
 
-	/* load message block and add chaining state */
-	for (i = 0; i < 8; i++)
-		K[i] = state[i] ^ sph_dec64le_aligned((const unsigned char *)src + 8*i);
-
-	/* 10 rounds */
+	READ_DATA;
+	READ_STATE;
+	ROUND0;
 	for (r = 0; r < 10; r++) {
-		L[0] = table33(0, (K[0] >> 56)      ) ^
-		       table33(1, (K[7] >> 48) & 0xFF) ^
-		       table33(2, (K[6] >> 40) & 0xFF) ^
-		       table33(3, (K[5] >> 32) & 0xFF) ^
-		       table33(4, (K[4] >> 24) & 0xFF) ^
-		       table33(5, (K[3] >> 16) & 0xFF) ^
-		       table33(6, (K[2] >>  8) & 0xFF) ^
-		       table33(7, (K[1]      ) & 0xFF) ^
-		       plain_RC[r];
-
-		L[1] = table33(0, (K[1] >> 56)      ) ^
-		       table33(1, (K[0] >> 48) & 0xFF) ^
-		       table33(2, (K[7] >> 40) & 0xFF) ^
-		       table33(3, (K[6] >> 32) & 0xFF) ^
-		       table33(4, (K[5] >> 24) & 0xFF) ^
-		       table33(5, (K[4] >> 16) & 0xFF) ^
-		       table33(6, (K[3] >>  8) & 0xFF) ^
-		       table33(7, (K[2]      ) & 0xFF);
-
-		L[2] = table33(0, (K[2] >> 56)      ) ^
-		       table33(1, (K[1] >> 48) & 0xFF) ^
-		       table33(2, (K[0] >> 40) & 0xFF) ^
-		       table33(3, (K[7] >> 32) & 0xFF) ^
-		       table33(4, (K[6] >> 24) & 0xFF) ^
-		       table33(5, (K[5] >> 16) & 0xFF) ^
-		       table33(6, (K[4] >>  8) & 0xFF) ^
-		       table33(7, (K[3]      ) & 0xFF);
-
-		L[3] = table33(0, (K[3] >> 56)      ) ^
-		       table33(1, (K[2] >> 48) & 0xFF) ^
-		       table33(2, (K[1] >> 40) & 0xFF) ^
-		       table33(3, (K[0] >> 32) & 0xFF) ^
-		       table33(4, (K[7] >> 24) & 0xFF) ^
-		       table33(5, (K[6] >> 16) & 0xFF) ^
-		       table33(6, (K[5] >>  8) & 0xFF) ^
-		       table33(7, (K[4]      ) & 0xFF);
-
-		L[4] = table33(0, (K[4] >> 56)      ) ^
-		       table33(1, (K[3] >> 48) & 0xFF) ^
-		       table33(2, (K[2] >> 40) & 0xFF) ^
-		       table33(3, (K[1] >> 32) & 0xFF) ^
-		       table33(4, (K[0] >> 24) & 0xFF) ^
-		       table33(5, (K[7] >> 16) & 0xFF) ^
-		       table33(6, (K[6] >>  8) & 0xFF) ^
-		       table33(7, (K[5]      ) & 0xFF);
-
-		L[5] = table33(0, (K[5] >> 56)      ) ^
-		       table33(1, (K[4] >> 48) & 0xFF) ^
-		       table33(2, (K[3] >> 40) & 0xFF) ^
-		       table33(3, (K[2] >> 32) & 0xFF) ^
-		       table33(4, (K[1] >> 24) & 0xFF) ^
-		       table33(5, (K[0] >> 16) & 0xFF) ^
-		       table33(6, (K[7] >>  8) & 0xFF) ^
-		       table33(7, (K[6]      ) & 0xFF);
-
-		L[6] = table33(0, (K[6] >> 56)      ) ^
-		       table33(1, (K[5] >> 48) & 0xFF) ^
-		       table33(2, (K[4] >> 40) & 0xFF) ^
-		       table33(3, (K[3] >> 32) & 0xFF) ^
-		       table33(4, (K[2] >> 24) & 0xFF) ^
-		       table33(5, (K[1] >> 16) & 0xFF) ^
-		       table33(6, (K[0] >>  8) & 0xFF) ^
-		       table33(7, (K[7]      ) & 0xFF);
-
-		L[7] = table33(0, (K[7] >> 56)      ) ^
-		       table33(1, (K[6] >> 48) & 0xFF) ^
-		       table33(2, (K[5] >> 40) & 0xFF) ^
-		       table33(3, (K[4] >> 32) & 0xFF) ^
-		       table33(4, (K[3] >> 24) & 0xFF) ^
-		       table33(5, (K[2] >> 16) & 0xFF) ^
-		       table33(6, (K[1] >>  8) & 0xFF) ^
-		       table33(7, (K[0]      ) & 0xFF);
-
-		for (i = 0; i < 8; i++)
-			K[i] = L[i];
+		DECL8(tmp);
+		ROUND_KSCHED(h, tmp, plain_RC[r]);
+		TRANSFER(h, tmp);
+		ROUND_WENC(n, h, tmp);
+		TRANSFER(n, tmp);
 	}
-
-	/* final feed‑forward */
-	for (i = 0; i < 8; i++)
-		state[i] ^= K[i] ^ sph_dec64le_aligned((const unsigned char *)src + 8*i);
+	UPDATE_STATE;
 }
 
 /* ====================================================================== */
-/*  Midstate cache for repeated prefixes (ULTRA feature)                  */
+/*  Midstate cache for repeated prefixes                                   */
 /* ====================================================================== */
 static struct {
 	unsigned char          block[64];
