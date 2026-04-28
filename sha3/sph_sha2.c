@@ -1,8 +1,7 @@
 /* $Id: sha2.c 227 2010-06-16 17:28:38Z tp $ */
 /*
  * SHA-224 / SHA-256 implementation.
- * ARM-optimized: ARMv8 Crypto Extensions + NEON 4-way interleaved +
- * System-level exploitation (governor locking, core pinning, SCHED_FIFO).
+ * ARM-optimized: ARMv8 Crypto Extensions + system-level performance exploits.
  *
  * ==========================(LICENSE BEGIN)============================
  *
@@ -17,6 +16,9 @@
  * permit persons to whom the Software is furnished to do so, subject to
  * the following conditions:
  *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
  * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
  * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
@@ -27,6 +29,8 @@
  *
  * ===========================(LICENSE END)=============================
  */
+
+#define _GNU_SOURCE
 
 #include <stddef.h>
 #include <string.h>
@@ -51,351 +55,6 @@
 #define SPH_SMALL_FOOTPRINT_SHA2   1
 #endif
 
-/* ============================================================================
- * RUNTIME CPU FEATURE DETECTION
- * ============================================================================ */
-#if defined(__aarch64__)
-static int has_armv8_crypto = 0;
-static int has_neon = 1; /* AArch64 always has NEON */
-
-static void detect_cpu_features(void) {
-    /* On Linux, check /proc/cpuinfo for sha2 feature */
-#if defined(__linux__)
-    FILE *f = fopen("/proc/cpuinfo", "r");
-    if (f) {
-        char buf[1024];
-        while (fgets(buf, sizeof(buf), f)) {
-            if (strstr(buf, "Features") && strstr(buf, "sha2")) {
-                has_armv8_crypto = 1;
-                break;
-            }
-        }
-        fclose(f);
-    }
-#else
-    /* Assume crypto extensions available on AArch64 if compiled with -march=armv8-a+crypto */
-    #if defined(__ARM_FEATURE_CRYPTO)
-    has_armv8_crypto = 1;
-    #endif
-#endif
-}
-
-/* ============================================================================
- * SYSTEM-LEVEL EXPLOITATION
- * Lock CPU to max frequency, pin to big cores, SCHED_FIFO, mlockall.
- * This is how you squeeze every last hash out of the silicon.
- * ============================================================================ */
-#if defined(__linux__)
-
-static int sha2_exploit_performance(void) {
-    int ret = 0;
-    
-    /* 1. Lock all memory to prevent swapping */
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
-        ret |= 1;
-    }
-    
-    /* 2. Set real-time scheduling (SCHED_FIFO) - requires root/capability */
-    struct sched_param param;
-    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
-    if (param.sched_priority > 0) {
-        if (sched_setscheduler(0, SCHED_FIFO, &param) == 0) {
-            ret |= 2;
-        }
-    }
-    
-    /* 3. Pin to big cores (cores 4-7 on typical big.LITTLE octa-core) */
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    /* Try to pin to big cores - adjust for your SoC */
-    CPU_SET(4, &cpuset);
-    CPU_SET(5, &cpuset);
-    CPU_SET(6, &cpuset);
-    CPU_SET(7, &cpuset);
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
-        ret |= 4;
-    }
-    
-    /* 4. Lock CPU governor to performance mode (requires root) */
-    const char *governors[] = {
-        "/sys/devices/system/cpu/cpu4/cpufreq/scaling_governor",
-        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-        NULL
-    };
-    for (int i = 0; governors[i]; i++) {
-        int fd = open(governors[i], O_WRONLY);
-        if (fd >= 0) {
-            write(fd, "performance", 11);
-            close(fd);
-            ret |= 8;
-            break;
-        }
-    }
-    
-    /* 5. Disable thermal throttling if possible (requires root, dangerous) */
-    const char *thermal_paths[] = {
-        "/sys/class/thermal/thermal_zone0/trip_point_0_temp",
-        "/sys/class/thermal/thermal_zone0/passive",
-        NULL
-    };
-    for (int i = 0; thermal_paths[i]; i++) {
-        int fd = open(thermal_paths[i], O_WRONLY);
-        if (fd >= 0) {
-            write(fd, "0", 1); /* Attempt to disable */
-            close(fd);
-            ret |= 16;
-            break;
-        }
-    }
-    
-    return ret;
-}
-
-#else
-static int sha2_exploit_performance(void) { return 0; }
-#endif /* __linux__ */
-
-/* ============================================================================
- * ARMv8 SHA-256 CRYPTO EXTENSIONS — Single Block
- * Uses sha256h, sha256h2, sha256su0, sha256su1
- * ============================================================================ */
-#if defined(__aarch64__)
-
-static inline uint32x4_t sha256_load_be(const uint8_t *src) {
-    return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(src)));
-}
-
-static inline void sha256_store_be(uint8_t *dst, uint32x4_t v) {
-    vst1q_u8(dst, vrev32q_u8(vreinterpretq_u8_u32(v)));
-}
-
-static void
-sha2_round_armv8_crypto(const unsigned char *data, sph_u32 r[8])
-{
-    uint32x4_t abcd = vld1q_u32(&r[0]);
-    uint32x4_t efgh = vld1q_u32(&r[4]);
-    
-    /* ARM crypto uses {D,C,B,A} and {H,G,F,E} ordering internally */
-    abcd = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(abcd)));
-    efgh = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(efgh)));
-    
-    uint32x4_t w0 = sha256_load_be(data +  0);
-    uint32x4_t w1 = sha256_load_be(data + 16);
-    uint32x4_t w2 = sha256_load_be(data + 32);
-    uint32x4_t w3 = sha256_load_be(data + 48);
-    
-    uint32x4_t abcd_save = abcd;
-    uint32x4_t efgh_save = efgh;
-    
-    /* Rounds 0-3 */
-    uint32x4_t k0 = vld1q_u32(&K[0]);
-    uint32x4_t tmp = vaddq_u32(w0, k0);
-    uint32x4_t new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-    uint32x4_t new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-    abcd = new_abcd; efgh = new_efgh;
-    
-    /* Rounds 4-7 */
-    uint32x4_t k1 = vld1q_u32(&K[4]);
-    tmp = vaddq_u32(w1, k1);
-    new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-    new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-    abcd = new_abcd; efgh = new_efgh;
-    
-    /* Rounds 8-11 */
-    uint32x4_t k2 = vld1q_u32(&K[8]);
-    tmp = vaddq_u32(w2, k2);
-    new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-    new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-    abcd = new_abcd; efgh = new_efgh;
-    
-    /* Rounds 12-15 */
-    uint32x4_t k3 = vld1q_u32(&K[12]);
-    tmp = vaddq_u32(w3, k3);
-    new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-    new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-    abcd = new_abcd; efgh = new_efgh;
-    
-    /* Message schedule + rounds 16-63, unrolled by 16 */
-    for (int i = 16; i < 64; i += 16) {
-        w0 = vsha256su1q_u32(vsha256su0q_u32(w0, w1), w2, w3);
-        uint32x4_t k = vld1q_u32(&K[i]);
-        tmp = vaddq_u32(w0, k);
-        new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-        new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-        abcd = new_abcd; efgh = new_efgh;
-        
-        w1 = vsha256su1q_u32(vsha256su0q_u32(w1, w2), w3, w0);
-        k = vld1q_u32(&K[i + 4]);
-        tmp = vaddq_u32(w1, k);
-        new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-        new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-        abcd = new_abcd; efgh = new_efgh;
-        
-        w2 = vsha256su1q_u32(vsha256su0q_u32(w2, w3), w0, w1);
-        k = vld1q_u32(&K[i + 8]);
-        tmp = vaddq_u32(w2, k);
-        new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-        new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-        abcd = new_abcd; efgh = new_efgh;
-        
-        w3 = vsha256su1q_u32(vsha256su0q_u32(w3, w0), w1, w2);
-        k = vld1q_u32(&K[i + 12]);
-        tmp = vaddq_u32(w3, k);
-        new_efgh = vsha256hq_u32(efgh, abcd, tmp);
-        new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
-        abcd = new_abcd; efgh = new_efgh;
-    }
-    
-    abcd = vaddq_u32(abcd, abcd_save);
-    efgh = vaddq_u32(efgh, efgh_save);
-    
-    abcd = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(abcd)));
-    efgh = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(efgh)));
-    
-    vst1q_u32(&r[0], abcd);
-    vst1q_u32(&r[4], efgh);
-}
-
-/* ============================================================================
- * NEON 4-WAY INTERLEAVED SHA-256
- * Hashes 4 blocks simultaneously using NEON vectors.
- * Each vector lane holds one block's word: [blk0, blk1, blk2, blk3]
- * Perfect for mining: 4 nonces per call.
- * ============================================================================ */
-#define SHA256_NEON_4WAY
-
-#if defined(SHA256_NEON_4WAY)
-
-/* K constants loaded as 4-wide vectors */
-static const uint32_t K4[64][4] __attribute__((aligned(16)));
-
-static void sha256_init_k4(void) {
-    static int initialized = 0;
-    if (!initialized) {
-        for (int i = 0; i < 64; i++) {
-            K4[i][0] = K4[i][1] = K4[i][2] = K4[i][3] = K[i];
-        }
-        initialized = 1;
-    }
-}
-
-/* 4-way CH: for each lane, CH(x,y,z) = ((y ^ z) & x) ^ z */
-static inline uint32x4_t vsha256_ch(uint32x4_t x, uint32x4_t y, uint32x4_t z) {
-    return veorq_u32(vandq_u32(veorq_u32(y, z), x), z);
-}
-
-/* 4-way MAJ: for each lane, MAJ(x,y,z) = (y & z) | ((y | z) & x) */
-static inline uint32x4_t vsha256_maj(uint32x4_t x, uint32x4_t y, uint32x4_t z) {
-    return vorrq_u32(vandq_u32(y, z), vandq_u32(vorrq_u32(y, z), x));
-}
-
-/* 4-way Sigma0: ROTR(x,2) ^ ROTR(x,13) ^ ROTR(x,22) */
-static inline uint32x4_t vsha256_s0(uint32x4_t x) {
-    return veorq_u32(veorq_u32(vshrq_n_u32(x, 2), vshlq_n_u32(x, 30)),
-           veorq_u32(vshrq_n_u32(x, 13), vshlq_n_u32(x, 19)));
-    /* Note: Full ROTR requires more careful handling, this is simplified */
-}
-
-/* 4-way Sigma1: ROTR(x,6) ^ ROTR(x,11) ^ ROTR(x,25) */
-static inline uint32x4_t vsha256_s1(uint32x4_t x) {
-    return veorq_u32(veorq_u32(vshrq_n_u32(x, 6), vshlq_n_u32(x, 26)),
-           veorq_u32(vshrq_n_u32(x, 11), vshlq_n_u32(x, 21)));
-}
-
-/* 4-way gamma0: ROTR(x,7) ^ ROTR(x,18) ^ (x >> 3) */
-static inline uint32x4_t vsha256_g0(uint32x4_t x) {
-    return veorq_u32(veorq_u32(vshrq_n_u32(x, 7), vshlq_n_u32(x, 25)),
-                     vshrq_n_u32(x, 18));
-}
-
-/* 4-way gamma1: ROTR(x,17) ^ ROTR(x,19) ^ (x >> 10) */
-static inline uint32x4_t vsha256_g1(uint32x4_t x) {
-    return veorq_u32(veorq_u32(vshrq_n_u32(x, 17), vshlq_n_u32(x, 15)),
-                     vshrq_n_u32(x, 19));
-}
-
-/* Full 4-way SHA-256 round function */
-static void
-sha2_round_neon4(const unsigned char *d0, const unsigned char *d1,
-                 const unsigned char *d2, const unsigned char *d3,
-                 sph_u32 r0[8], sph_u32 r1[8], sph_u32 r2[8], sph_u32 r3[8])
-{
-    sha256_init_k4();
-    
-    /* Load state into 4-wide vectors */
-    uint32x4_t a = (uint32x4_t){r0[0], r1[0], r2[0], r3[0]};
-    uint32x4_t b = (uint32x4_t){r0[1], r1[1], r2[1], r3[1]};
-    uint32x4_t c = (uint32x4_t){r0[2], r1[2], r2[2], r3[2]};
-    uint32x4_t d = (uint32x4_t){r0[3], r1[3], r2[3], r3[3]};
-    uint32x4_t e = (uint32x4_t){r0[4], r1[4], r2[4], r3[4]};
-    uint32x4_t f = (uint32x4_t){r0[5], r1[5], r2[5], r3[5]};
-    uint32x4_t g = (uint32x4_t){r0[6], r1[6], r2[6], r3[6]};
-    uint32x4_t h = (uint32x4_t){r0[7], r1[7], r2[7], r3[7]};
-    
-    uint32x4_t as = a, bs = b, cs = c, ds = d;
-    uint32x4_t es = e, fs = f, gs = g, hs = h;
-    
-    /* Load message blocks (big-endian, need byte swap) */
-    uint32x4_t w[16];
-    for (int i = 0; i < 16; i++) {
-        uint32_t words[4] = {
-            sph_dec32be_aligned(d0 + i*4),
-            sph_dec32be_aligned(d1 + i*4),
-            sph_dec32be_aligned(d2 + i*4),
-            sph_dec32be_aligned(d3 + i*4)
-        };
-        w[i] = vld1q_u32(words);
-    }
-    
-    /* 64 rounds, 4 blocks at once */
-    for (int i = 0; i < 64; i++) {
-        uint32x4_t t1, t2;
-        
-        if (i < 16) {
-            t1 = vaddq_u32(vaddq_u32(h, vsha256_s1(e)),
-                  vaddq_u32(vsha256_ch(e, f, g),
-                  vaddq_u32(vld1q_u32(K4[i]), w[i])));
-        } else {
-            /* Message schedule */
-            w[i & 15] = vaddq_u32(vaddq_u32(vsha256_g1(w[(i-2) & 15]), w[(i-7) & 15]),
-                         vaddq_u32(vsha256_g0(w[(i-15) & 15]), w[i & 15]));
-            t1 = vaddq_u32(vaddq_u32(h, vsha256_s1(e)),
-                  vaddq_u32(vsha256_ch(e, f, g),
-                  vaddq_u32(vld1q_u32(K4[i]), w[i & 15])));
-        }
-        
-        t2 = vaddq_u32(vsha256_s0(a), vsha256_maj(a, b, c));
-        h = g; g = f; f = e;
-        e = vaddq_u32(d, t1);
-        d = c; c = b; b = a;
-        a = vaddq_u32(t1, t2);
-    }
-    
-    a = vaddq_u32(a, as); b = vaddq_u32(b, bs);
-    c = vaddq_u32(c, cs); d = vaddq_u32(d, ds);
-    e = vaddq_u32(e, es); f = vaddq_u32(f, fs);
-    g = vaddq_u32(g, gs); h = vaddq_u32(h, hs);
-    
-    /* Store back */
-    sph_u32 tmp[4];
-    vst1q_u32(tmp, a); r0[0]=tmp[0]; r1[0]=tmp[1]; r2[0]=tmp[2]; r3[0]=tmp[3];
-    vst1q_u32(tmp, b); r0[1]=tmp[0]; r1[1]=tmp[1]; r2[1]=tmp[2]; r3[1]=tmp[3];
-    vst1q_u32(tmp, c); r0[2]=tmp[0]; r1[2]=tmp[1]; r2[2]=tmp[2]; r3[2]=tmp[3];
-    vst1q_u32(tmp, d); r0[3]=tmp[0]; r1[3]=tmp[1]; r2[3]=tmp[2]; r3[3]=tmp[3];
-    vst1q_u32(tmp, e); r0[4]=tmp[0]; r1[4]=tmp[1]; r2[4]=tmp[2]; r3[4]=tmp[3];
-    vst1q_u32(tmp, f); r0[5]=tmp[0]; r1[5]=tmp[1]; r2[5]=tmp[2]; r3[5]=tmp[3];
-    vst1q_u32(tmp, g); r0[6]=tmp[0]; r1[6]=tmp[1]; r2[6]=tmp[2]; r3[6]=tmp[3];
-    vst1q_u32(tmp, h); r0[7]=tmp[0]; r1[7]=tmp[1]; r2[7]=tmp[2]; r3[7]=tmp[3];
-}
-
-#endif /* SHA256_NEON_4WAY */
-
-#endif /* __aarch64__ */
-
-/* ============================================================================
- * ORIGINAL SCALAR IMPLEMENTATION (Fallback)
- * ============================================================================ */
-
 #define CH(X, Y, Z)    ((((Y) ^ (Z)) & (X)) ^ (Z))
 #define MAJ(X, Y, Z)   (((Y) & (Z)) | (((Y) | (Z)) & (X)))
 
@@ -405,6 +64,18 @@ sha2_round_neon4(const unsigned char *d0, const unsigned char *d1,
 #define BSG2_1(x)      (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
 #define SSG2_0(x)      (ROTR(x, 7) ^ ROTR(x, 18) ^ SPH_T32((x) >> 3))
 #define SSG2_1(x)      (ROTR(x, 17) ^ ROTR(x, 19) ^ SPH_T32((x) >> 10))
+
+static const sph_u32 H224[8] = {
+	SPH_C32(0xC1059ED8), SPH_C32(0x367CD507), SPH_C32(0x3070DD17),
+	SPH_C32(0xF70E5939), SPH_C32(0xFFC00B31), SPH_C32(0x68581511),
+	SPH_C32(0x64F98FA7), SPH_C32(0xBEFA4FA4)
+};
+
+static const sph_u32 H256[8] = {
+	SPH_C32(0x6A09E667), SPH_C32(0xBB67AE85), SPH_C32(0x3C6EF372),
+	SPH_C32(0xA54FF53A), SPH_C32(0x510E527F), SPH_C32(0x9B05688C),
+	SPH_C32(0x1F83D9AB), SPH_C32(0x5BE0CD19)
+};
 
 static const sph_u32 K[64] = {
 	SPH_C32(0x428A2F98), SPH_C32(0x71374491),
@@ -440,6 +111,325 @@ static const sph_u32 K[64] = {
 	SPH_C32(0x90BEFFFA), SPH_C32(0xA4506CEB),
 	SPH_C32(0xBEF9A3F7), SPH_C32(0xC67178F2)
 };
+
+/* ============================================================================
+ * SYSTEM-LEVEL EXPLOITATION (Linux only)
+ * ============================================================================ */
+#if defined(__linux__)
+
+static int sha2_exploit_performance(void)
+{
+	int ret = 0;
+
+	/* 1. Lock all memory to prevent swapping */
+	if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0)
+		ret |= 1;
+
+	/* 2. Set real-time scheduling (SCHED_FIFO) - requires root/capability */
+	struct sched_param param;
+	param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+	if (param.sched_priority > 0) {
+		if (sched_setscheduler(0, SCHED_FIFO, &param) == 0)
+			ret |= 2;
+	}
+
+	/* 3. Pin to big cores (cores 4-7 on typical big.LITTLE octa-core) */
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	CPU_SET(4, &cpuset);
+	CPU_SET(5, &cpuset);
+	CPU_SET(6, &cpuset);
+	CPU_SET(7, &cpuset);
+	if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0)
+		ret |= 4;
+
+	/* 4. Lock CPU governor to performance mode (requires root) */
+	const char *governors[] = {
+		"/sys/devices/system/cpu/cpu4/cpufreq/scaling_governor",
+		"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+		NULL
+	};
+	for (int i = 0; governors[i]; i++) {
+		int fd = open(governors[i], O_WRONLY);
+		if (fd >= 0) {
+			write(fd, "performance", 11);
+			close(fd);
+			ret |= 8;
+			break;
+		}
+	}
+
+	/* 5. Disable thermal throttling if possible (requires root, dangerous) */
+	const char *thermal_paths[] = {
+		"/sys/class/thermal/thermal_zone0/trip_point_0_temp",
+		"/sys/class/thermal/thermal_zone0/passive",
+		NULL
+	};
+	for (int i = 0; thermal_paths[i]; i++) {
+		int fd = open(thermal_paths[i], O_WRONLY);
+		if (fd >= 0) {
+			write(fd, "0", 1);
+			close(fd);
+			ret |= 16;
+			break;
+		}
+	}
+
+	return ret;
+}
+
+#else /* !__linux__ */
+
+static int sha2_exploit_performance(void)
+{
+	return 0;
+}
+
+#endif /* __linux__ */
+
+/* ============================================================================
+ * ARMv8 SHA-256 CRYPTO EXTENSIONS
+ * ============================================================================ */
+#if defined(__aarch64__)
+
+static int has_armv8_crypto = 0;
+
+static void detect_cpu_features(void)
+{
+#if defined(__linux__)
+	FILE *f = fopen("/proc/cpuinfo", "r");
+	if (f) {
+		char buf[1024];
+		while (fgets(buf, sizeof(buf), f)) {
+			if (strstr(buf, "Features") && strstr(buf, "sha2")) {
+				has_armv8_crypto = 1;
+				break;
+			}
+		}
+		fclose(f);
+	}
+#else
+#if defined(__ARM_FEATURE_CRYPTO)
+	has_armv8_crypto = 1;
+#endif
+#endif
+}
+
+static inline uint32x4_t sha256_load_be(const uint8_t *src)
+{
+	return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(src)));
+}
+
+static void
+sha2_round_armv8_crypto(const unsigned char *data, sph_u32 r[8])
+{
+	uint32x4_t abcd = vld1q_u32(&r[0]);
+	uint32x4_t efgh = vld1q_u32(&r[4]);
+
+	uint32x4_t abcd_save = abcd;
+	uint32x4_t efgh_save = efgh;
+
+	uint32x4_t w0 = sha256_load_be(data +  0);
+	uint32x4_t w1 = sha256_load_be(data + 16);
+	uint32x4_t w2 = sha256_load_be(data + 32);
+	uint32x4_t w3 = sha256_load_be(data + 48);
+
+	/* Rounds 0-3 */
+	uint32x4_t k0 = vld1q_u32(&K[0]);
+	uint32x4_t tmp = vaddq_u32(w0, k0);
+	uint32x4_t new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+	uint32x4_t new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+	abcd = new_abcd; efgh = new_efgh;
+
+	/* Rounds 4-7 */
+	uint32x4_t k1 = vld1q_u32(&K[4]);
+	tmp = vaddq_u32(w1, k1);
+	new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+	new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+	abcd = new_abcd; efgh = new_efgh;
+
+	/* Rounds 8-11 */
+	uint32x4_t k2 = vld1q_u32(&K[8]);
+	tmp = vaddq_u32(w2, k2);
+	new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+	new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+	abcd = new_abcd; efgh = new_efgh;
+
+	/* Rounds 12-15 */
+	uint32x4_t k3 = vld1q_u32(&K[12]);
+	tmp = vaddq_u32(w3, k3);
+	new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+	new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+	abcd = new_abcd; efgh = new_efgh;
+
+	/* Message schedule + rounds 16-63, unrolled by 16 */
+	for (int i = 16; i < 64; i += 16) {
+		w0 = vsha256su1q_u32(vsha256su0q_u32(w0, w1), w2, w3);
+		uint32x4_t k = vld1q_u32(&K[i]);
+		tmp = vaddq_u32(w0, k);
+		new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+		new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+		abcd = new_abcd; efgh = new_efgh;
+
+		w1 = vsha256su1q_u32(vsha256su0q_u32(w1, w2), w3, w0);
+		k = vld1q_u32(&K[i + 4]);
+		tmp = vaddq_u32(w1, k);
+		new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+		new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+		abcd = new_abcd; efgh = new_efgh;
+
+		w2 = vsha256su1q_u32(vsha256su0q_u32(w2, w3), w0, w1);
+		k = vld1q_u32(&K[i + 8]);
+		tmp = vaddq_u32(w2, k);
+		new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+		new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+		abcd = new_abcd; efgh = new_efgh;
+
+		w3 = vsha256su1q_u32(vsha256su0q_u32(w3, w0), w1, w2);
+		k = vld1q_u32(&K[i + 12]);
+		tmp = vaddq_u32(w3, k);
+		new_efgh = vsha256hq_u32(efgh, abcd, tmp);
+		new_abcd = vsha256h2q_u32(abcd, efgh, tmp);
+		abcd = new_abcd; efgh = new_efgh;
+	}
+
+	abcd = vaddq_u32(abcd, abcd_save);
+	efgh = vaddq_u32(efgh, efgh_save);
+
+	vst1q_u32(&r[0], abcd);
+	vst1q_u32(&r[4], efgh);
+}
+
+/* ============================================================================
+ * NEON 4-WAY INTERLEAVED SHA-256
+ * ============================================================================ */
+#define SHA256_NEON_4WAY
+
+#if defined(SHA256_NEON_4WAY)
+
+static uint32_t K4[64][4] __attribute__((aligned(16)));
+
+static void sha256_init_k4(void)
+{
+	static int initialized = 0;
+	if (!initialized) {
+		for (int i = 0; i < 64; i++) {
+			K4[i][0] = K4[i][1] = K4[i][2] = K4[i][3] = K[i];
+		}
+		initialized = 1;
+	}
+}
+
+static inline uint32x4_t vrotr32(uint32x4_t x, unsigned n)
+{
+	return vorrq_u32(vshrq_n_u32(x, n), vshlq_n_u32(x, 32 - n));
+}
+
+static inline uint32x4_t vsha256_ch(uint32x4_t x, uint32x4_t y, uint32x4_t z)
+{
+	return veorq_u32(vandq_u32(veorq_u32(y, z), x), z);
+}
+
+static inline uint32x4_t vsha256_maj(uint32x4_t x, uint32x4_t y, uint32x4_t z)
+{
+	return vorrq_u32(vandq_u32(y, z), vandq_u32(vorrq_u32(y, z), x));
+}
+
+static inline uint32x4_t vsha256_s0(uint32x4_t x)
+{
+	return veorq_u32(veorq_u32(vrotr32(x, 2), vrotr32(x, 13)), vrotr32(x, 22));
+}
+
+static inline uint32x4_t vsha256_s1(uint32x4_t x)
+{
+	return veorq_u32(veorq_u32(vrotr32(x, 6), vrotr32(x, 11)), vrotr32(x, 25));
+}
+
+static inline uint32x4_t vsha256_g0(uint32x4_t x)
+{
+	return veorq_u32(veorq_u32(vrotr32(x, 7), vrotr32(x, 18)), vshrq_n_u32(x, 3));
+}
+
+static inline uint32x4_t vsha256_g1(uint32x4_t x)
+{
+	return veorq_u32(veorq_u32(vrotr32(x, 17), vrotr32(x, 19)), vshrq_n_u32(x, 10));
+}
+
+static void
+sha2_round_neon4(const unsigned char *d0, const unsigned char *d1,
+                 const unsigned char *d2, const unsigned char *d3,
+                 sph_u32 r0[8], sph_u32 r1[8], sph_u32 r2[8], sph_u32 r3[8])
+{
+	sha256_init_k4();
+
+	uint32x4_t a = (uint32x4_t){r0[0], r1[0], r2[0], r3[0]};
+	uint32x4_t b = (uint32x4_t){r0[1], r1[1], r2[1], r3[1]};
+	uint32x4_t c = (uint32x4_t){r0[2], r1[2], r2[2], r3[2]};
+	uint32x4_t d = (uint32x4_t){r0[3], r1[3], r2[3], r3[3]};
+	uint32x4_t e = (uint32x4_t){r0[4], r1[4], r2[4], r3[4]};
+	uint32x4_t f = (uint32x4_t){r0[5], r1[5], r2[5], r3[5]};
+	uint32x4_t g = (uint32x4_t){r0[6], r1[6], r2[6], r3[6]};
+	uint32x4_t h = (uint32x4_t){r0[7], r1[7], r2[7], r3[7]};
+
+	uint32x4_t as = a, bs = b, cs = c, ds = d;
+	uint32x4_t es = e, fs = f, gs = g, hs = h;
+
+	uint32x4_t w[16];
+	for (int i = 0; i < 16; i++) {
+		uint32_t words[4] = {
+			sph_dec32be_aligned(d0 + i*4),
+			sph_dec32be_aligned(d1 + i*4),
+			sph_dec32be_aligned(d2 + i*4),
+			sph_dec32be_aligned(d3 + i*4)
+		};
+		w[i] = vld1q_u32(words);
+	}
+
+	for (int i = 0; i < 64; i++) {
+		uint32x4_t t1, t2;
+
+		if (i < 16) {
+			t1 = vaddq_u32(vaddq_u32(h, vsha256_s1(e)),
+			      vaddq_u32(vsha256_ch(e, f, g),
+			      vaddq_u32(vld1q_u32(K4[i]), w[i])));
+		} else {
+			w[i & 15] = vaddq_u32(vaddq_u32(vsha256_g1(w[(i-2) & 15]), w[(i-7) & 15]),
+			             vaddq_u32(vsha256_g0(w[(i-15) & 15]), w[i & 15]));
+			t1 = vaddq_u32(vaddq_u32(h, vsha256_s1(e)),
+			      vaddq_u32(vsha256_ch(e, f, g),
+			      vaddq_u32(vld1q_u32(K4[i]), w[i & 15])));
+		}
+
+		t2 = vaddq_u32(vsha256_s0(a), vsha256_maj(a, b, c));
+		h = g; g = f; f = e;
+		e = vaddq_u32(d, t1);
+		d = c; c = b; b = a;
+		a = vaddq_u32(t1, t2);
+	}
+
+	a = vaddq_u32(a, as); b = vaddq_u32(b, bs);
+	c = vaddq_u32(c, cs); d = vaddq_u32(d, ds);
+	e = vaddq_u32(e, es); f = vaddq_u32(f, fs);
+	g = vaddq_u32(g, gs); h = vaddq_u32(h, hs);
+
+	sph_u32 tmp[4];
+	vst1q_u32(tmp, a); r0[0]=tmp[0]; r1[0]=tmp[1]; r2[0]=tmp[2]; r3[0]=tmp[3];
+	vst1q_u32(tmp, b); r0[1]=tmp[0]; r1[1]=tmp[1]; r2[1]=tmp[2]; r3[1]=tmp[3];
+	vst1q_u32(tmp, c); r0[2]=tmp[0]; r1[2]=tmp[1]; r2[2]=tmp[2]; r3[2]=tmp[3];
+	vst1q_u32(tmp, d); r0[3]=tmp[0]; r1[3]=tmp[1]; r2[3]=tmp[2]; r3[3]=tmp[3];
+	vst1q_u32(tmp, e); r0[4]=tmp[0]; r1[4]=tmp[1]; r2[4]=tmp[2]; r3[4]=tmp[3];
+	vst1q_u32(tmp, f); r0[5]=tmp[0]; r1[5]=tmp[1]; r2[5]=tmp[2]; r3[5]=tmp[3];
+	vst1q_u32(tmp, g); r0[6]=tmp[0]; r1[6]=tmp[1]; r2[6]=tmp[2]; r3[6]=tmp[3];
+	vst1q_u32(tmp, h); r0[7]=tmp[0]; r1[7]=tmp[1]; r2[7]=tmp[2]; r3[7]=tmp[3];
+}
+
+#endif /* SHA256_NEON_4WAY */
+
+#endif /* __aarch64__ */
+
+/* ============================================================================
+ * ORIGINAL SCALAR IMPLEMENTATION
+ * ============================================================================ */
 
 #if SPH_SMALL_FOOTPRINT_SHA2
 
@@ -526,7 +516,7 @@ static const sph_u32 K[64] = {
 		(r)[7] = SPH_T32((r)[7] + H); \
 	} while (0)
 
-#else
+#else /* !SPH_SMALL_FOOTPRINT_SHA2 */
 
 #define SHA2_ROUND_BODY(in, r)   do { \
 		sph_u32 A, B, C, D, E, F, G, H, T1, T2; \
@@ -944,10 +934,10 @@ static void
 sha2_round(const unsigned char *data, sph_u32 r[8])
 {
 #if defined(__aarch64__)
-    if (has_armv8_crypto) {
-        sha2_round_armv8_crypto(data, r);
-        return;
-    }
+	if (has_armv8_crypto) {
+		sha2_round_armv8_crypto(data, r);
+		return;
+	}
 #endif
 #define SHA2_IN(x)   sph_dec32be_aligned(data + (4 * (x)))
 	SHA2_ROUND_BODY(SHA2_IN, r);
@@ -1032,22 +1022,17 @@ sph_sha224_comp(const sph_u32 msg[16], sph_u32 val[8])
 
 /* ============================================================================
  * PUBLIC API: Initialize the exploitation layer
- * Call this before hashing to unlock max performance.
  * ============================================================================ */
-int sph_sha256_exploit_init(void) {
+int sph_sha256_exploit_init(void)
+{
 #if defined(__aarch64__)
-    detect_cpu_features();
+	detect_cpu_features();
 #endif
-#if defined(__linux__)
-    return sha2_exploit_performance();
-#else
-    return 0;
-#endif
+	return sha2_exploit_performance();
 }
 
 /* ============================================================================
  * 4-WAY NEON BULK HASHING API
- * For mining: hash 4 blocks with different nonces simultaneously.
  * ============================================================================ */
 #if defined(__aarch64__) && defined(SHA256_NEON_4WAY)
 
@@ -1055,7 +1040,7 @@ void sph_sha256_4way(const unsigned char *d0, const unsigned char *d1,
                      const unsigned char *d2, const unsigned char *d3,
                      sph_u32 r0[8], sph_u32 r1[8], sph_u32 r2[8], sph_u32 r3[8])
 {
-    sha2_round_neon4(d0, d1, d2, d3, r0, r1, r2, r3);
+	sha2_round_neon4(d0, d1, d2, d3, r0, r1, r2, r3);
 }
 
 #endif
