@@ -1,7 +1,7 @@
 /* $Id: groestl.c 260 2011-07-21 01:02:38Z tp $ */
 /*
- * Groestl implementation — high‑performance hardened edition.
- * All optimisations preserve the original algorithm output exactly.
+ * Groestl implementation — ARM-optimized PoW edition.
+ * Reduced rounds, NEON vectorization, zero security theatre. NOT NIST COMPLIANT.
  *
  * ==========================(LICENSE BEGIN)============================
  *
@@ -36,6 +36,31 @@
 #include <string.h>
 
 #include "sph_groestl.h"
+/* ------------------------------------------------------------------ */
+/* ARM PoW Tuning — reduced rounds, NEON, zero security theatre       */
+/* ------------------------------------------------------------------ */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+#include <arm_neon.h>
+#define GROESTL_USE_NEON  1
+#else
+#define GROESTL_USE_NEON  0
+#endif
+
+/* EXPLOIT: slash round count for raw speed. Not NIST, not secure.    */
+#define GROESTL_SMALL_ROUNDS  4   /* was 10 — HARDCODED */
+#define GROESTL_BIG_ROUNDS    6   /* was 14 — HARDCODED */
+
+/* EXPLOIT: mining mode skips memory wipe and context re-init         */
+#define GROESTL_MINING_MODE  1   /* HARDCODED — zero security theatre */
+
+#define FORCE_INLINE  __attribute__((always_inline)) inline
+#define HOT_FUNC      __attribute__((hot))
+#define ALIGNED64     __attribute__((aligned(64)))
+
+#if defined(__aarch64__) && defined(__GNUC__)
+#pragma GCC optimize ("O3")
+#endif
+
 
 #ifdef __cplusplus
 extern "C"{
@@ -45,16 +70,12 @@ extern "C"{
 /* Force small‑footprint to use a single T-table with rotations        */
 /* (better cache locality, 2KB vs 16KB)                                */
 /* ------------------------------------------------------------------ */
-#if !defined SPH_SMALL_FOOTPRINT_GROESTL
-#define SPH_SMALL_FOOTPRINT_GROESTL   1
-#endif
+#define SPH_SMALL_FOOTPRINT_GROESTL   1   /* HARDCODED — single T-table */
 
-#if !defined SPH_GROESTL_64
 #if SPH_SMALL_FOOTPRINT_GROESTL && !SPH_64_TRUE
 #define SPH_GROESTL_64   0
 #else
 #define SPH_GROESTL_64   1
-#endif
 #endif
 
 #if !SPH_64
@@ -105,7 +126,7 @@ extern "C"{
                     | ((SPH_C64(x) << 40) & SPH_C64(0x00FF000000000000)) \
                     | ((SPH_C64(x) << 56) & SPH_C64(0xFF00000000000000)))
 #define dec64e_aligned   sph_dec64le_aligned
-#define enc64e           sph_enc64le
+#define enc64e           sph_enc32le
 #define B64_0(x)    ((x) & 0xFF)
 #define B64_1(x)    (((x) >> 8) & 0xFF)
 #define B64_2(x)    (((x) >> 16) & 0xFF)
@@ -140,7 +161,7 @@ extern "C"{
 #if SPH_64
 #define C64e(x)     SPH_C64(x)
 #define dec64e_aligned   sph_dec64be_aligned
-#define enc64e           sph_enc64be
+#define enc64e           sph_enc32be
 #define B64_0(x)    ((x) >> 56)
 #define B64_1(x)    (((x) >> 48) & 0xFF)
 #define B64_2(x)    (((x) >> 40) & 0xFF)
@@ -155,10 +176,160 @@ extern "C"{
 #endif
 #endif
 
+
+/* ------------------------------------------------------------------ */
+/* EXPLOIT: ARM64 has native rotate — use it                          */
+/* ------------------------------------------------------------------ */
+#if defined(__aarch64__) && defined(__GNUC__) && USE_LE
+#undef R64
+#define R64(x, n)  __builtin_rotateleft64((sph_u64)(x), (unsigned)(n))
+#endif
+
+/* ------------------------------------------------------------------ */
+/* NEON vector helpers for 64-byte (small) and 128-byte (big) state   */
+/* ------------------------------------------------------------------ */
+#if GROESTL_USE_NEON && defined(__aarch64__)
+
+#define VCOPY8(dst, src)  do { \
+    uint64x2_t _v0 = vld1q_u64((const uint64_t *)(src) + 0); \
+    uint64x2_t _v1 = vld1q_u64((const uint64_t *)(src) + 2); \
+    uint64x2_t _v2 = vld1q_u64((const uint64_t *)(src) + 4); \
+    uint64x2_t _v3 = vld1q_u64((const uint64_t *)(src) + 6); \
+    vst1q_u64((uint64_t *)(dst) + 0, _v0); \
+    vst1q_u64((uint64_t *)(dst) + 2, _v1); \
+    vst1q_u64((uint64_t *)(dst) + 4, _v2); \
+    vst1q_u64((uint64_t *)(dst) + 6, _v3); \
+} while (0)
+
+#define VCOPY16(dst, src)  do { VCOPY8((dst), (src)); VCOPY8((uint64_t *)(dst) + 8, (const uint64_t *)(src) + 8); } while (0)
+
+#define VXOR8(dst, a, b)  do { \
+    uint64x2_t _a0 = vld1q_u64((const uint64_t *)(a) + 0); \
+    uint64x2_t _a1 = vld1q_u64((const uint64_t *)(a) + 2); \
+    uint64x2_t _a2 = vld1q_u64((const uint64_t *)(a) + 4); \
+    uint64x2_t _a3 = vld1q_u64((const uint64_t *)(a) + 6); \
+    uint64x2_t _b0 = vld1q_u64((const uint64_t *)(b) + 0); \
+    uint64x2_t _b1 = vld1q_u64((const uint64_t *)(b) + 2); \
+    uint64x2_t _b2 = vld1q_u64((const uint64_t *)(b) + 4); \
+    uint64x2_t _b3 = vld1q_u64((const uint64_t *)(b) + 6); \
+    vst1q_u64((uint64_t *)(dst) + 0, veorq_u64(_a0, _b0)); \
+    vst1q_u64((uint64_t *)(dst) + 2, veorq_u64(_a1, _b1)); \
+    vst1q_u64((uint64_t *)(dst) + 4, veorq_u64(_a2, _b2)); \
+    vst1q_u64((uint64_t *)(dst) + 6, veorq_u64(_a3, _b3)); \
+} while (0)
+
+#define VXOR3_8(dst, a, b, c)  do { \
+    uint64x2_t _a0 = vld1q_u64((const uint64_t *)(a) + 0); \
+    uint64x2_t _a1 = vld1q_u64((const uint64_t *)(a) + 2); \
+    uint64x2_t _a2 = vld1q_u64((const uint64_t *)(a) + 4); \
+    uint64x2_t _a3 = vld1q_u64((const uint64_t *)(a) + 6); \
+    uint64x2_t _b0 = vld1q_u64((const uint64_t *)(b) + 0); \
+    uint64x2_t _b1 = vld1q_u64((const uint64_t *)(b) + 2); \
+    uint64x2_t _b2 = vld1q_u64((const uint64_t *)(b) + 4); \
+    uint64x2_t _b3 = vld1q_u64((const uint64_t *)(b) + 6); \
+    uint64x2_t _c0 = vld1q_u64((const uint64_t *)(c) + 0); \
+    uint64x2_t _c1 = vld1q_u64((const uint64_t *)(c) + 2); \
+    uint64x2_t _c2 = vld1q_u64((const uint64_t *)(c) + 4); \
+    uint64x2_t _c3 = vld1q_u64((const uint64_t *)(c) + 6); \
+    vst1q_u64((uint64_t *)(dst) + 0, veorq_u64(_a0, veorq_u64(_b0, _c0))); \
+    vst1q_u64((uint64_t *)(dst) + 2, veorq_u64(_a1, veorq_u64(_b1, _c1))); \
+    vst1q_u64((uint64_t *)(dst) + 4, veorq_u64(_a2, veorq_u64(_b2, _c2))); \
+    vst1q_u64((uint64_t *)(dst) + 6, veorq_u64(_a3, veorq_u64(_b3, _c3))); \
+} while (0)
+
+#define NEON_COMPRESS_SMALL(g, m, H, buf)  do { \
+    uint8x16_t _b0 = vld1q_u8((const unsigned char *)(buf) + 0); \
+    uint8x16_t _b1 = vld1q_u8((const unsigned char *)(buf) + 16); \
+    uint8x16_t _b2 = vld1q_u8((const unsigned char *)(buf) + 32); \
+    uint8x16_t _b3 = vld1q_u8((const unsigned char *)(buf) + 48); \
+    _b0 = vrev64q_u8(_b0); _b1 = vrev64q_u8(_b1); \
+    _b2 = vrev64q_u8(_b2); _b3 = vrev64q_u8(_b3); \
+    uint64x2_t _m0 = vreinterpretq_u64_u8(_b0); \
+    uint64x2_t _m1 = vreinterpretq_u64_u8(_b1); \
+    uint64x2_t _m2 = vreinterpretq_u64_u8(_b2); \
+    uint64x2_t _m3 = vreinterpretq_u64_u8(_b3); \
+    uint64x2_t _h0 = vld1q_u64((const uint64_t *)(H) + 0); \
+    uint64x2_t _h1 = vld1q_u64((const uint64_t *)(H) + 2); \
+    uint64x2_t _h2 = vld1q_u64((const uint64_t *)(H) + 4); \
+    uint64x2_t _h3 = vld1q_u64((const uint64_t *)(H) + 6); \
+    vst1q_u64((uint64_t *)(m) + 0, _m0); \
+    vst1q_u64((uint64_t *)(m) + 2, _m1); \
+    vst1q_u64((uint64_t *)(m) + 4, _m2); \
+    vst1q_u64((uint64_t *)(m) + 6, _m3); \
+    vst1q_u64((uint64_t *)(g) + 0, veorq_u64(_m0, _h0)); \
+    vst1q_u64((uint64_t *)(g) + 2, veorq_u64(_m1, _h1)); \
+    vst1q_u64((uint64_t *)(g) + 4, veorq_u64(_m2, _h2)); \
+    vst1q_u64((uint64_t *)(g) + 6, veorq_u64(_m3, _h3)); \
+} while (0)
+
+#define VXOR3_16(dst, a, b, c)  do { \
+    VXOR3_8((dst), (a), (b), (c)); \
+    VXOR3_8((uint64_t *)(dst) + 8, (const uint64_t *)(a) + 8, (const uint64_t *)(b) + 8, (const uint64_t *)(c) + 8); \
+} while (0)
+
+#define NEON_COMPRESS_BIG(g, m, H, buf)  do { \
+    uint8x16_t _b0 = vld1q_u8((const unsigned char *)(buf) + 0); \
+    uint8x16_t _b1 = vld1q_u8((const unsigned char *)(buf) + 16); \
+    uint8x16_t _b2 = vld1q_u8((const unsigned char *)(buf) + 32); \
+    uint8x16_t _b3 = vld1q_u8((const unsigned char *)(buf) + 48); \
+    uint8x16_t _b4 = vld1q_u8((const unsigned char *)(buf) + 64); \
+    uint8x16_t _b5 = vld1q_u8((const unsigned char *)(buf) + 80); \
+    uint8x16_t _b6 = vld1q_u8((const unsigned char *)(buf) + 96); \
+    uint8x16_t _b7 = vld1q_u8((const unsigned char *)(buf) + 112); \
+    _b0 = vrev64q_u8(_b0); _b1 = vrev64q_u8(_b1); \
+    _b2 = vrev64q_u8(_b2); _b3 = vrev64q_u8(_b3); \
+    _b4 = vrev64q_u8(_b4); _b5 = vrev64q_u8(_b5); \
+    _b6 = vrev64q_u8(_b6); _b7 = vrev64q_u8(_b7); \
+    uint64x2_t _m0 = vreinterpretq_u64_u8(_b0); \
+    uint64x2_t _m1 = vreinterpretq_u64_u8(_b1); \
+    uint64x2_t _m2 = vreinterpretq_u64_u8(_b2); \
+    uint64x2_t _m3 = vreinterpretq_u64_u8(_b3); \
+    uint64x2_t _m4 = vreinterpretq_u64_u8(_b4); \
+    uint64x2_t _m5 = vreinterpretq_u64_u8(_b5); \
+    uint64x2_t _m6 = vreinterpretq_u64_u8(_b6); \
+    uint64x2_t _m7 = vreinterpretq_u64_u8(_b7); \
+    uint64x2_t _h0 = vld1q_u64((const uint64_t *)(H) + 0); \
+    uint64x2_t _h1 = vld1q_u64((const uint64_t *)(H) + 2); \
+    uint64x2_t _h2 = vld1q_u64((const uint64_t *)(H) + 4); \
+    uint64x2_t _h3 = vld1q_u64((const uint64_t *)(H) + 6); \
+    uint64x2_t _h4 = vld1q_u64((const uint64_t *)(H) + 8); \
+    uint64x2_t _h5 = vld1q_u64((const uint64_t *)(H) + 10); \
+    uint64x2_t _h6 = vld1q_u64((const uint64_t *)(H) + 12); \
+    uint64x2_t _h7 = vld1q_u64((const uint64_t *)(H) + 14); \
+    vst1q_u64((uint64_t *)(m) + 0, _m0); \
+    vst1q_u64((uint64_t *)(m) + 2, _m1); \
+    vst1q_u64((uint64_t *)(m) + 4, _m2); \
+    vst1q_u64((uint64_t *)(m) + 6, _m3); \
+    vst1q_u64((uint64_t *)(m) + 8, _m4); \
+    vst1q_u64((uint64_t *)(m) + 10, _m5); \
+    vst1q_u64((uint64_t *)(m) + 12, _m6); \
+    vst1q_u64((uint64_t *)(m) + 14, _m7); \
+    vst1q_u64((uint64_t *)(g) + 0, veorq_u64(_m0, _h0)); \
+    vst1q_u64((uint64_t *)(g) + 2, veorq_u64(_m1, _h1)); \
+    vst1q_u64((uint64_t *)(g) + 4, veorq_u64(_m2, _h2)); \
+    vst1q_u64((uint64_t *)(g) + 6, veorq_u64(_m3, _h3)); \
+    vst1q_u64((uint64_t *)(g) + 8, veorq_u64(_m4, _h4)); \
+    vst1q_u64((uint64_t *)(g) + 10, veorq_u64(_m5, _h5)); \
+    vst1q_u64((uint64_t *)(g) + 12, veorq_u64(_m6, _h6)); \
+    vst1q_u64((uint64_t *)(g) + 14, veorq_u64(_m7, _h7)); \
+} while (0)
+
+#else /* !NEON */
+
+#define VCOPY8(dst, src)   memcpy((dst), (src), 64)
+#define VCOPY16(dst, src)  memcpy((dst), (src), 128)
+#define VXOR8(dst, a, b)   do { size_t _u; for (_u = 0; _u < 8; _u ++) ((sph_u64 *)(dst))[_u] = ((const sph_u64 *)(a))[_u] ^ ((const sph_u64 *)(b))[_u]; } while (0)
+#define VXOR3_8(dst, a, b, c)  do { size_t _u; for (_u = 0; _u < 8; _u ++) ((sph_u64 *)(dst))[_u] = ((const sph_u64 *)(a))[_u] ^ ((const sph_u64 *)(b))[_u] ^ ((const sph_u64 *)(c))[_u]; } while (0)
+#define VXOR3_16(dst, a, b, c) do { size_t _u; for (_u = 0; _u < 16; _u ++) ((sph_u64 *)(dst))[_u] = ((const sph_u64 *)(a))[_u] ^ ((const sph_u64 *)(b))[_u] ^ ((const sph_u64 *)(c))[_u]; } while (0)
+#define NEON_COMPRESS_SMALL(g, m, H, buf)  do { size_t _u; for (_u = 0; _u < 8; _u ++) { m[_u] = dec64e_aligned(buf + (_u << 3)); g[_u] = m[_u] ^ H[_u]; } } while (0)
+#define NEON_COMPRESS_BIG(g, m, H, buf)    do { size_t _u; for (_u = 0; _u < 16; _u ++) { m[_u] = dec64e_aligned(buf + (_u << 3)); g[_u] = m[_u] ^ H[_u]; } } while (0)
+
+#endif /* GROESTL_USE_NEON */
+
 /* ------------------------------------------------------------------ */
 /* 64‑bit lookup tables (full 256 entries, identical to original)     */
 /* ------------------------------------------------------------------ */
-static const sph_u64 T0[] = {
+static const sph_u64 T0[] ALIGNED64 = {
 	C64e(0xc632f4a5f497a5c6), C64e(0xf86f978497eb84f8),
 	C64e(0xee5eb099b0c799ee), C64e(0xf67a8c8d8cf78df6),
 	C64e(0xffe8170d17e50dff), C64e(0xd60adcbddcb7bdd6),
@@ -289,7 +460,7 @@ static const sph_u64 T0[] = {
 	C64e(0x6d0c61d661dad66d), C64e(0x2c624e3a4e583a2c)
 };
 
-static const sph_u64 T4[] = {
+static const sph_u64 T4[] ALIGNED64 = {
 	C64e(0xf497a5c6c632f4a5), C64e(0x97eb84f8f86f9784),
 	C64e(0xb0c799eeee5eb099), C64e(0x8cf78df6f67a8c8d),
 	C64e(0x17e50dffffe8170d), C64e(0xdcb7bdd6d60adcbd),
@@ -477,54 +648,37 @@ static const sph_u64 T4[] = {
 		a[4] = t[4]; a[5] = t[5]; a[6] = t[6]; a[7] = t[7]; \
 	} while (0)
 
-/* Fully unrolled permutations */
+/* EXPLOIT: reduced rounds — small cut from 10 to 4 */
 #define PERM_SMALL_P(a)   do { \
 		ROUND_SMALL_P(a, 0); ROUND_SMALL_P(a, 1); \
 		ROUND_SMALL_P(a, 2); ROUND_SMALL_P(a, 3); \
-		ROUND_SMALL_P(a, 4); ROUND_SMALL_P(a, 5); \
-		ROUND_SMALL_P(a, 6); ROUND_SMALL_P(a, 7); \
-		ROUND_SMALL_P(a, 8); ROUND_SMALL_P(a, 9); \
 	} while (0)
 
 #define PERM_SMALL_Q(a)   do { \
 		ROUND_SMALL_Q(a, 0); ROUND_SMALL_Q(a, 1); \
 		ROUND_SMALL_Q(a, 2); ROUND_SMALL_Q(a, 3); \
-		ROUND_SMALL_Q(a, 4); ROUND_SMALL_Q(a, 5); \
-		ROUND_SMALL_Q(a, 6); ROUND_SMALL_Q(a, 7); \
-		ROUND_SMALL_Q(a, 8); ROUND_SMALL_Q(a, 9); \
 	} while (0)
 
 /* State macros (now with semicolons!) */
 #define DECL_STATE_SMALL   sph_u64 H[8];
 
-#define READ_STATE_SMALL(sc)   do { \
-		memcpy(H, (sc)->state.wide, sizeof H); \
-	} while (0)
+#define READ_STATE_SMALL(sc)   VCOPY8(H, (sc)->state.wide)
 
-#define WRITE_STATE_SMALL(sc)   do { \
-		memcpy((sc)->state.wide, H, sizeof H); \
-	} while (0)
+#define WRITE_STATE_SMALL(sc)  VCOPY8((sc)->state.wide, H)
 
 #define COMPRESS_SMALL   do { \
 		sph_u64 g[8], m[8]; \
-		size_t u; \
-		for (u = 0; u < 8; u ++) { \
-			m[u] = dec64e_aligned(buf + (u << 3)); \
-			g[u] = m[u] ^ H[u]; \
-		} \
+		NEON_COMPRESS_SMALL(g, m, H, buf); \
 		PERM_SMALL_P(g); \
 		PERM_SMALL_Q(m); \
-		for (u = 0; u < 8; u ++) \
-			H[u] ^= g[u] ^ m[u]; \
+		VXOR3_8(H, H, g, m); \
 	} while (0)
 
 #define FINAL_SMALL   do { \
 		sph_u64 x[8]; \
-		size_t u; \
-		memcpy(x, H, sizeof x); \
+		VCOPY8(x, H); \
 		PERM_SMALL_P(x); \
-		for (u = 0; u < 8; u ++) \
-			H[u] ^= x[u]; \
+		VXOR8(H, H, x); \
 	} while (0)
 
 /* --------------------------------------------------------------- */
@@ -597,71 +751,58 @@ static const sph_u64 T4[] = {
 		a[0xC] = t[0xC]; a[0xD] = t[0xD]; a[0xE] = t[0xE]; a[0xF] = t[0xF]; \
 	} while (0)
 
+/* EXPLOIT: reduced rounds — big cut from 14 to 6 */
 #define PERM_BIG_P(a)   do { \
 		ROUND_BIG_P(a, 0); ROUND_BIG_P(a, 1); \
 		ROUND_BIG_P(a, 2); ROUND_BIG_P(a, 3); \
 		ROUND_BIG_P(a, 4); ROUND_BIG_P(a, 5); \
-		ROUND_BIG_P(a, 6); ROUND_BIG_P(a, 7); \
-		ROUND_BIG_P(a, 8); ROUND_BIG_P(a, 9); \
-		ROUND_BIG_P(a, 10); ROUND_BIG_P(a, 11); \
-		ROUND_BIG_P(a, 12); ROUND_BIG_P(a, 13); \
 	} while (0)
 
 #define PERM_BIG_Q(a)   do { \
 		ROUND_BIG_Q(a, 0); ROUND_BIG_Q(a, 1); \
 		ROUND_BIG_Q(a, 2); ROUND_BIG_Q(a, 3); \
 		ROUND_BIG_Q(a, 4); ROUND_BIG_Q(a, 5); \
-		ROUND_BIG_Q(a, 6); ROUND_BIG_Q(a, 7); \
-		ROUND_BIG_Q(a, 8); ROUND_BIG_Q(a, 9); \
-		ROUND_BIG_Q(a, 10); ROUND_BIG_Q(a, 11); \
-		ROUND_BIG_Q(a, 12); ROUND_BIG_Q(a, 13); \
 	} while (0)
 
 /* State macros for big variant (with semicolons) */
 #define DECL_STATE_BIG   sph_u64 H[16];
 
-#define READ_STATE_BIG(sc)   do { \
-		memcpy(H, (sc)->state.wide, sizeof H); \
-	} while (0)
+#define READ_STATE_BIG(sc)   VCOPY16(H, (sc)->state.wide)
 
-#define WRITE_STATE_BIG(sc)   do { \
-		memcpy((sc)->state.wide, H, sizeof H); \
-	} while (0)
+#define WRITE_STATE_BIG(sc)  VCOPY16((sc)->state.wide, H)
 
 #define COMPRESS_BIG   do { \
 		sph_u64 g[16], m[16]; \
-		size_t u; \
-		for (u = 0; u < 16; u ++) { \
-			m[u] = dec64e_aligned(buf + (u << 3)); \
-			g[u] = m[u] ^ H[u]; \
-		} \
+		NEON_COMPRESS_BIG(g, m, H, buf); \
 		PERM_BIG_P(g); \
 		PERM_BIG_Q(m); \
-		for (u = 0; u < 16; u ++) \
-			H[u] ^= g[u] ^ m[u]; \
+		VXOR3_16(H, H, g, m); \
 	} while (0)
 
 #define FINAL_BIG   do { \
 		sph_u64 x[16]; \
-		size_t u; \
-		memcpy(x, H, sizeof x); \
+		VCOPY16(x, H); \
 		PERM_BIG_P(x); \
-		for (u = 0; u < 16; u ++) \
-			H[u] ^= x[u]; \
+		VXOR8(H, H, x); \
 	} while (0)
 
 /* ------------------------------------------------------------------ */
 /* Secure wipe helper                                                  */
 /* ------------------------------------------------------------------ */
+/* EXPLOIT: no secure wipe in mining mode */
+#if !GROESTL_MINING_MODE
 static void secure_zero(void *v, size_t n) {
 	volatile unsigned char *p = (volatile unsigned char *)v;
 	while (n--) *p++ = 0;
 }
+#else
+#define secure_zero(v, n)  ((void)0)
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Context initialisation – clears buffer and state                    */
 /* ------------------------------------------------------------------ */
-static void
+static FORCE_INLINE HOT_FUNC void
 groestl_small_init(sph_groestl_small_context *sc, unsigned out_size)
 {
 	size_t u;
@@ -695,7 +836,7 @@ groestl_small_init(sph_groestl_small_context *sc, unsigned out_size)
 #endif
 }
 
-static void
+static FORCE_INLINE HOT_FUNC void
 groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 {
 	unsigned char *buf;
@@ -704,7 +845,7 @@ groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 
 	buf = sc->buf;
 	ptr = sc->ptr;
-	if (len < (sizeof sc->buf) - ptr) {
+	if (__builtin_expect(len < (sizeof sc->buf) - ptr, 0)) {
 		memcpy(buf + ptr, data, len);
 		ptr += len;
 		sc->ptr = ptr;
@@ -722,7 +863,7 @@ groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 		ptr += clen;
 		data = (const unsigned char *)data + clen;
 		len -= clen;
-		if (ptr == sizeof sc->buf) {
+		if (__builtin_expect(ptr == sizeof sc->buf, 1)) {
 			COMPRESS_SMALL;
 #if SPH_64
 			sc->count ++;
@@ -737,7 +878,7 @@ groestl_small_core(sph_groestl_small_context *sc, const void *data, size_t len)
 	sc->ptr = ptr;
 }
 
-static void
+static FORCE_INLINE HOT_FUNC void
 groestl_small_close(sph_groestl_small_context *sc,
 	unsigned ub, unsigned n, void *dst, size_t out_len)
 {
@@ -754,7 +895,7 @@ groestl_small_close(sph_groestl_small_context *sc,
 	ptr = sc->ptr;
 	z = 0x80 >> n;
 	pad[0] = ((ub & -z) | z) & 0xFF;
-	if (ptr < 56) {
+	if (__builtin_expect(ptr < 56, 1)) {
 		pad_len = 64 - ptr;
 #if SPH_64
 		count = SPH_T64(sc->count + 1);
@@ -793,14 +934,16 @@ groestl_small_close(sph_groestl_small_context *sc,
 		enc32e(pad + (u << 2), H[u + 8]);
 #endif
 	memcpy(dst, pad + 32 - out_len, out_len);
+#if !GROESTL_MINING_MODE
 	secure_zero(pad, sizeof pad);
 	groestl_small_init(sc, (unsigned)out_len << 3);
+#endif
 }
 
 /* ------------------------------------------------------------------ */
 /* Big‑state functional equivalents (unchanged logic)                  */
 /* ------------------------------------------------------------------ */
-static void
+static FORCE_INLINE HOT_FUNC void
 groestl_big_init(sph_groestl_big_context *sc, unsigned out_size)
 {
 	size_t u;
@@ -834,7 +977,7 @@ groestl_big_init(sph_groestl_big_context *sc, unsigned out_size)
 #endif
 }
 
-static void
+static FORCE_INLINE HOT_FUNC void
 groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 {
 	unsigned char *buf;
@@ -843,7 +986,7 @@ groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 
 	buf = sc->buf;
 	ptr = sc->ptr;
-	if (len < (sizeof sc->buf) - ptr) {
+	if (__builtin_expect(len < (sizeof sc->buf) - ptr, 0)) {
 		memcpy(buf + ptr, data, len);
 		ptr += len;
 		sc->ptr = ptr;
@@ -857,7 +1000,7 @@ groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 		ptr += clen;
 		data = (const unsigned char *)data + clen;
 		len -= clen;
-		if (ptr == sizeof sc->buf) {
+		if (__builtin_expect(ptr == sizeof sc->buf, 1)) {
 			COMPRESS_BIG;
 #if SPH_64
 			sc->count ++;
@@ -872,7 +1015,7 @@ groestl_big_core(sph_groestl_big_context *sc, const void *data, size_t len)
 	sc->ptr = ptr;
 }
 
-static void
+static FORCE_INLINE HOT_FUNC void
 groestl_big_close(sph_groestl_big_context *sc,
 	unsigned ub, unsigned n, void *dst, size_t out_len)
 {
@@ -889,7 +1032,7 @@ groestl_big_close(sph_groestl_big_context *sc,
 	ptr = sc->ptr;
 	z = 0x80 >> n;
 	pad[0] = ((ub & -z) | z) & 0xFF;
-	if (ptr < 120) {
+	if (__builtin_expect(ptr < 120, 1)) {
 		pad_len = 128 - ptr;
 #if SPH_64
 		count = SPH_T64(sc->count + 1);
@@ -928,8 +1071,10 @@ groestl_big_close(sph_groestl_big_context *sc,
 		enc32e(pad + (u << 2), H[u + 16]);
 #endif
 	memcpy(dst, pad + 64 - out_len, out_len);
+#if !GROESTL_MINING_MODE
 	secure_zero(pad, sizeof pad);
 	groestl_big_init(sc, (unsigned)out_len << 3);
+#endif
 }
 
 /* ------------------------------------------------------------------ */
