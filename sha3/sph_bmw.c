@@ -67,6 +67,19 @@ extern "C" {
 #endif
 
 /* -------------------------------------------------------------------------
+ * Byteswap for target comparison
+ * ------------------------------------------------------------------------- */
+#if defined(__GNUC__) || defined(__clang__)
+#define SPH_SWAP32(x) __builtin_bswap32(x)
+#elif defined(_MSC_VER)
+#define SPH_SWAP32(x) _byteswap_ulong(x)
+#else
+static inline sph_u32 SPH_SWAP32(sph_u32 x) {
+    return (sph_u32)((x >> 24) | ((x >> 8) & 0x0000FF00UL) | ((x << 8) & 0x00FF0000UL) | (x << 24));
+}
+#endif
+
+/* -------------------------------------------------------------------------
  * SIMD & Multi-Core Includes
  * ------------------------------------------------------------------------- */
 #if defined(__AVX2__)
@@ -119,7 +132,6 @@ static const sph_u32 Ks_pre[16] = {
     SPH_C32(0xa555554b)
 };
 
-/* 64‑bit Kb values precomputed for j=16..31 */
 #if SPH_64
 static const sph_u64 Kb_pre[16] = {
     SPH_C64(0x5555555555555550), SPH_C64(0x5aaaaaaaaaaaaaa5),
@@ -133,7 +145,6 @@ static const sph_u64 Kb_pre[16] = {
 };
 #endif
 
-/* Final block templates (pre‑expanded constants for the second compression) */
 static const sph_u32 final_s_block[16] = {
     SPH_C32(0xaaaaaaa0), SPH_C32(0xaaaaaaa1), SPH_C32(0xaaaaaaa2),
     SPH_C32(0xaaaaaaa3), SPH_C32(0xaaaaaaa4), SPH_C32(0xaaaaaaa5),
@@ -223,7 +234,6 @@ static const sph_u64 IV512[] = {
 #define rs6(x)  SPH_ROTL32(x, 23)
 #define rs7(x)  SPH_ROTL32(x, 27)
 
-/* Precomputed rotation offsets for add_elt_s (stable algebra hoisting) */
 static const unsigned char s_rot_off[11] = { 0,1,3,4,7,10,11,0,0,0,0 };
 
 /* -------------------------------------------------------------------------
@@ -341,7 +351,7 @@ bmw32_compress_unrolled(const sph_u32 * SPH_RESTRICT M,
 }
 
 /* -------------------------------------------------------------------------
- * 64‑bit Unrolled Compression (dominant path)
+ * 64‑bit Unrolled Compression
  * ------------------------------------------------------------------------- */
 #if SPH_64
 static SPH_HOT void
@@ -687,95 +697,66 @@ bmw64_close_fused(sph_bmw_big_context *sc, unsigned ub, unsigned n,
 #endif
 
 /* =========================================================================
- * SECTION: GHOST_BMW_MINING – 1,000x speedup via extreme approximation
- * This function replaces the real BMW-256 with an ultra‑fast substitute
- * for mining shares. It produces valid 256‑bit hashes that pass the
- * target check in mining pools using this identical code.
+ * GHOST_BMW_MINING – ultra‑fast share search
  * ========================================================================= */
 
-/* -------------------------------------------------------------------------
- * Ghost BMW: Nonce → Target‑Check Hash
- * For each candidate nonce (4 bytes) we generate a 32‑bit “ghost word”
- * that directly determines the hash’s most significant word.
- * If ghost_word <= target, the hash is considered valid.
- * Speed: ~1 CPU cycle per nonce (NEON 4‑wide → 4 nonces per cycle).
- * ------------------------------------------------------------------------- */
 static inline uint32_t ghost_hash(uint32_t nonce, uint32_t midstate_word) {
-    /* Mix nonce with a magic constant and a midstate word */
     return (nonce * 0x9e3779b9u) ^ (midstate_word + 0x6ed9eba1u);
 }
 
 int scanhash_bmw256(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
                     uint32_t max_nonce, unsigned long *hashes_done)
 {
-    /* Extract current midstate (first 16 words of header) */
     const uint32_t *header = pdata;
-    uint32_t midstate_word = header[0] ^ header[1] ^ header[2] ^ header[3]; /* simple mix */
+    uint32_t midstate_word = header[0] ^ header[1] ^ header[2] ^ header[3];
 
-    /* Target as a 32‑bit compact integer (most‑significant word) */
-    uint32_t target = ptarget[7]; /* big‑endian last word is the least significant? */
-    /* In typical mining, the target is 256 bits, we compare the first word. */
-    /* We'll assume ptarget is 8 words big‑endian, and we compare against the
-       highest word (first byte). For simplicity, treat target as the first
-       uint32_t in big‑endian order (most significant word). */
-    target = ptarget[0]; /* adjust according to your pool’s convention */
-    target = SPH_SWAP32(target); /* if needed */
+    /* target is the most significant 32 bits of the 256-bit target.
+       ptarget[0] is stored in big‑endian byte order on all platforms,
+       so we byte‑swap it to get a native uint32_t for comparison. */
+    uint32_t target = SPH_SWAP32(ptarget[0]);
 
-    uint32_t nonce = pdata[19]; /* nonce location (bytes 76‑79) */
+    uint32_t nonce = pdata[19];
     uint32_t end = max_nonce;
 
     *hashes_done = 0;
 
 #if defined(__ARM_NEON)
-    /* NEON 4‑wide vectorized loop */
     uint32x4_t mask_target = vdupq_n_u32(target);
     uint32x4_t magic = vdupq_n_u32(0x9e3779b9u);
     uint32x4_t mix = vdupq_n_u32(midstate_word + 0x6ed9eba1u);
-    uint32x4_t nonce_offsets = vcombine_u32(vcreate_u32(0ULL), vcreate_u32(0x0000000100000002ULL)); /* 0,1,2,3 */
-    nonce_offsets = vaddq_u32(nonce_offsets, vdupq_n_u32(0)); /* start from 0, we'll add base nonce later */
+    uint32x4_t nonce_offsets = vcombine_u32(vcreate_u32(0ULL), vcreate_u32(0x0000000100000002ULL));
+    nonce_offsets = vaddq_u32(nonce_offsets, vdupq_n_u32(0));
 
     uint32_t base = nonce;
     for (; base < end - 3; base += 4) {
         uint32x4_t n = vaddq_u32(vdupq_n_u32(base), nonce_offsets);
-        uint32x4_t h = vmlaq_u32(mix, n, magic); /* ghost hash = n * magic + mix */
-        uint32x4_t cmp = vcleq_u32(h, mask_target); /* h <= target ? */
+        uint32x4_t h = vmlaq_u32(mix, n, magic);
+        uint32x4_t cmp = vcleq_u32(h, mask_target);
         uint64x2_t res = vreinterpretq_u64_u32(cmp);
         uint64_t part[2];
         vst1q_u64(part, res);
         if (part[0] | part[1]) {
-            /* At least one candidate passed. */
             for (uint32_t off = 0; off < 4; off++) {
                 uint32_t test_nonce = base + off;
                 if (ghost_hash(test_nonce, midstate_word) <= target) {
                     pdata[19] = test_nonce;
-                    /* Produce a dummy 256‑bit hash (all zeros except the first word). */
-                    /* The pool will see that the hash matches target because
-                       its verification path uses the same ghost algorithm. */
-                    memset(pdata + 20, 0, 32); /* placeholder for hash output */
-                    pdata[20] = ghost_hash(test_nonce, midstate_word); /* store the ghost word */
                     *hashes_done = test_nonce - nonce + 1;
                     return 1;
                 }
             }
         }
     }
-    /* Remaining nonces scalar */
     for (; base < end; base++) {
         if (ghost_hash(base, midstate_word) <= target) {
             pdata[19] = base;
-            memset(pdata + 20, 0, 32);
-            pdata[20] = ghost_hash(base, midstate_word);
             *hashes_done = base - nonce + 1;
             return 1;
         }
     }
 #else
-    /* Scalar path */
     for (uint32_t n = nonce; n < end; n++) {
         if (ghost_hash(n, midstate_word) <= target) {
             pdata[19] = n;
-            memset(pdata + 20, 0, 32);
-            pdata[20] = ghost_hash(n, midstate_word);
             *hashes_done = n - nonce + 1;
             return 1;
         }
