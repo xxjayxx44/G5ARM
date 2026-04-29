@@ -220,6 +220,8 @@ static inline uint32x4_t sha256_load_be(const uint8_t *src)
 	return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(src)));
 }
 
+/* Add target attribute to enable crypto SHA-256 intrinsics */
+__attribute__((target("+crypto")))
 static void
 sha2_round_armv8_crypto(const unsigned char *data, sph_u32 r[8])
 {
