@@ -46,6 +46,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "sph_groestl.h"
 
@@ -937,130 +938,80 @@ groestl_big_close(sph_groestl_big_context *sc,
 int scanhash_groestl256(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
                     uint32_t max_nonce, unsigned long *hashes_done)
 {
-	unsigned char header[80];
-	unsigned char midstate[64]; /* state after first 64 bytes */
+	uint32_t start_nonce = pdata[19];
+	uint32_t n = start_nonce;
+	uint32_t end = max_nonce;
+	unsigned char hash[32];
 	sph_groestl_small_context ctx;
+	unsigned char header[80];
+	sph_u64 midstate[8];
 
-	/* Copy the 80‑byte header and compute the midstate */
 	memcpy(header, pdata, 80);
+
+	/* Compute midstate after first 64 bytes */
 	sph_groestl256_init(&ctx);
-	sph_groestl256(&ctx, header, 64);  /* first 64 bytes */
-	/* save midstate (64‑bit words, 16 of them) */
+	sph_groestl256(&ctx, header, 64);
 	memcpy(midstate, ctx.state.wide, 64);
 
-	uint32_t nonce = pdata[19];
-	uint32_t end = max_nonce;
 	*hashes_done = 0;
 
-	/* The second block is header[64..67] (nonce) + 0x80 + zeros + length */
-	/* We'll manually construct the second block and compute the final hash */
-	unsigned char block2[64];
-	memset(block2, 0, 64);
-	/* Copy the last 16 bytes of header (including nonce spot) */
-	memcpy(block2, header + 64, 16);  /* nonce at offset 12 within block2 */
-	/* Padding: 0x80 at byte 16, then zeros until byte 56, then 64‑bit length */
-	block2[16] = 0x80;
-	/* length = 80 bytes = 640 bits = 0x280 */
-	block2[56] = 0x00;
-	block2[57] = 0x00;
-	block2[58] = 0x00;
-	block2[59] = 0x00;
-	block2[60] = 0x00;
-	block2[61] = 0x00;
-	block2[62] = 0x02;
-	block2[63] = 0x80;
+	/* Prepare second block: bytes 64-79 + padding.
+	   80 bytes total -> 1 block + 16 bytes remainder.
+	   ptr=16 (<56) so pad_len=48 and count=2. */
+	union {
+		unsigned char b[64];
+		sph_u64 w[8];
+	} block2;
 
-	/* Final block constants (pre‑defined final_s_block) are all‑ones except 0xaaaaaaa0 etc */
-	static const sph_u64 final_block[16] = {
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa),
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa),
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa),
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa),
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa),
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa),
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa),
-		C64e(0xaaaaaaaaaaaaaaaa), C64e(0xaaaaaaaaaaaaaaaa)
-	};
+	memcpy(block2.b, header + 64, 16);
+	block2.b[16] = 0x80;
+	memset(block2.b + 17, 0, 39);
+	/* Length field: block count = 2, big-endian 64-bit */
+	block2.b[56] = 0x00; block2.b[57] = 0x00; block2.b[58] = 0x00; block2.b[59] = 0x00;
+	block2.b[60] = 0x00; block2.b[61] = 0x00; block2.b[62] = 0x00; block2.b[63] = 0x02;
 
-	/* Temporary state for second compression */
-	sph_u64 H2[16];
-	sph_u64 M[16];
-	sph_u64 H[8];
+	for (; n < end; n++) {
+		/* Insert nonce (little-endian at offset 12 within block2 = header bytes 76-79) */
+		block2.b[12] = (uint8_t)n;
+		block2.b[13] = (uint8_t)(n >> 8);
+		block2.b[14] = (uint8_t)(n >> 16);
+		block2.b[15] = (uint8_t)(n >> 24);
 
-	/* Pre‑load midstate */
-	memcpy(H2, midstate, 64);
+		/* Restore midstate */
+		sph_u64 H[8];
+		memcpy(H, midstate, 64);
 
-	/* For each nonce, compress second block and check target */
-	for (uint32_t n = nonce; n < end; n++) {
-		/* Insert nonce into block2 (little‑endian) */
-		{
-			uint8_t *p = block2 + 12; /* nonce at bytes 12‑15 in big‑endian? Actually nonce is at bytes 76‑79 of header, which is block2[12..15] */
-			p[0] = (uint8_t)(n);
-			p[1] = (uint8_t)(n >> 8);
-			p[2] = (uint8_t)(n >> 16);
-			p[3] = (uint8_t)(n >> 24);
-		}
+		/* Compress second block using the same macro as the library */
+		unsigned char *buf = block2.b;
+		COMPRESS_SMALL;
 
-		/* Compute compression of second block */
-		/* Read M as 16 64‑bit words from block2 */
-		for (int i = 0; i < 16; i++) {
-			M[i] = sph_dec64le_aligned(block2 + 8*i);
-		}
+		/* Finalize: P(H) ^ H  (exactly what FINAL_SMALL does) */
+		FINAL_SMALL;
 
-		/* Compression function: H_out = compress(M, H_in) */
-		/* We'll use a local compress_small_direct that does not use global buffers */
-		/* Replicate what compress_small does but with explicit arguments */
-		sph_u64 g[8], m[8];
-		sph_u64 state[8];
-		memcpy(state, H2, 64); /* copy H2 to state */
-		for (int u = 0; u < 8; u++) {
-			m[u] = M[u];
-			g[u] = m[u] ^ state[u];
-		}
-		/* P permutation */
-		{
-			sph_u64 a[8];
-			memcpy(a, g, 64);
-			PERM_SMALL_P(a);
-			/* Q permutation on m */
-			sph_u64 b[8];
-			memcpy(b, m, 64);
-			PERM_SMALL_Q(b);
-			/* XOR result into state */
-			for (int u = 0; u < 8; u++)
-				state[u] ^= a[u] ^ b[u];
-		}
-		/* state now holds H' (output of second block compression). */
-
-		/* Now do the final compression with final_block */
-		{
-			sph_u64 g2[8], m2[8];
-			for (int u = 0; u < 8; u++) {
-				m2[u] = final_block[u];
-				g2[u] = m2[u] ^ state[u];
-			}
-			PERM_SMALL_P(g2);
-			PERM_SMALL_Q(m2);
-			for (int u = 0; u < 8; u++)
-				state[u] ^= g2[u] ^ m2[u];
-		}
-		/* Final output hash is state[4..7] (little‑endian) */ 
-		uint32_t hash[8];
+		/* Extract hash: last 4 words (256 bits), little-endian */
 		for (int u = 0; u < 4; u++)
-			sph_enc32le(((unsigned char*)hash) + 4*u, (uint32_t)state[u+4]);
+			sph_enc64le(hash + 8*u, H[u + 4]);
 
-		/* Compare first 4 bytes (big‑endian target) with target[0] */
-		if (hash[7] <= ptarget[7]) { /* simplified target check: last word (LE) */
+		/* Compare to target (little-endian uint32_t arrays, MSW at [7]) */
+		const uint32_t *h32 = (const uint32_t *)hash;
+		int k;
+		for (k = 7; k >= 0; k--) {
+			if (h32[k] < ptarget[k]) {
+				pdata[19] = n;
+				*hashes_done = n - start_nonce + 1;
+				return 1;
+			}
+			if (h32[k] > ptarget[k])
+				break;
+		}
+		if (k < 0) { /* exact match */
 			pdata[19] = n;
-			memcpy(pdata + 20, hash, 32); /* store hash in pdata */
-			*hashes_done = n - nonce + 1;
+			*hashes_done = n - start_nonce + 1;
 			return 1;
 		}
-		/* Restore H2 from midstate for next iteration */
-		memcpy(H2, midstate, 64);
 	}
 
-	*hashes_done = end - nonce;
+	*hashes_done = end - start_nonce;
 	return 0;
 }
 
