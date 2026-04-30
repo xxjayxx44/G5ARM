@@ -34,6 +34,17 @@
  * @enhancements   Advanced ARM/x86 PoW optimisations, midstate, etc.
  */
 
+/* ====================================================================
+ * AUTO-ENABLE defaults so that -DSPH_LITTLE_ENDIAN=1 -DSPH_64=1 are
+ * no longer required on the command line.
+ * ==================================================================== */
+#ifndef SPH_LITTLE_ENDIAN
+ #define SPH_LITTLE_ENDIAN  1
+#endif
+#ifndef SPH_64
+ #define SPH_64             1
+#endif
+
 #include <stddef.h>
 #include <string.h>
 
@@ -1342,98 +1353,6 @@ static const sph_u64 QC_SMALL[10][8] GROESTL_ALIGN64 = {
     }
 };
 
-#else /* Big-endian */
-
-static const sph_u64 PC_SMALL[10][8] GROESTL_ALIGN64 = {
-    {
-        SPH_C64(0x0000000000000000), SPH_C64(0x1000000000000000), SPH_C64(0x2000000000000000), SPH_C64(0x3000000000000000),
-        SPH_C64(0x4000000000000000), SPH_C64(0x5000000000000000), SPH_C64(0x6000000000000000), SPH_C64(0x7000000000000000)
-    },
-    {
-        SPH_C64(0x0100000000000000), SPH_C64(0x1100000000000000), SPH_C64(0x2100000000000000), SPH_C64(0x3100000000000000),
-        SPH_C64(0x4100000000000000), SPH_C64(0x5100000000000000), SPH_C64(0x6100000000000000), SPH_C64(0x7100000000000000)
-    },
-    {
-        SPH_C64(0x0200000000000000), SPH_C64(0x1200000000000000), SPH_C64(0x2200000000000000), SPH_C64(0x3200000000000000),
-        SPH_C64(0x4200000000000000), SPH_C64(0x5200000000000000), SPH_C64(0x6200000000000000), SPH_C64(0x7200000000000000)
-    },
-    {
-        SPH_C64(0x0300000000000000), SPH_C64(0x1300000000000000), SPH_C64(0x2300000000000000), SPH_C64(0x3300000000000000),
-        SPH_C64(0x4300000000000000), SPH_C64(0x5300000000000000), SPH_C64(0x6300000000000000), SPH_C64(0x7300000000000000)
-    },
-    {
-        SPH_C64(0x0400000000000000), SPH_C64(0x1400000000000000), SPH_C64(0x2400000000000000), SPH_C64(0x3400000000000000),
-        SPH_C64(0x4400000000000000), SPH_C64(0x5400000000000000), SPH_C64(0x6400000000000000), SPH_C64(0x7400000000000000)
-    },
-    {
-        SPH_C64(0x0500000000000000), SPH_C64(0x1500000000000000), SPH_C64(0x2500000000000000), SPH_C64(0x3500000000000000),
-        SPH_C64(0x4500000000000000), SPH_C64(0x5500000000000000), SPH_C64(0x6500000000000000), SPH_C64(0x7500000000000000)
-    },
-    {
-        SPH_C64(0x0600000000000000), SPH_C64(0x1600000000000000), SPH_C64(0x2600000000000000), SPH_C64(0x3600000000000000),
-        SPH_C64(0x4600000000000000), SPH_C64(0x5600000000000000), SPH_C64(0x6600000000000000), SPH_C64(0x7600000000000000)
-    },
-    {
-        SPH_C64(0x0700000000000000), SPH_C64(0x1700000000000000), SPH_C64(0x2700000000000000), SPH_C64(0x3700000000000000),
-        SPH_C64(0x4700000000000000), SPH_C64(0x5700000000000000), SPH_C64(0x6700000000000000), SPH_C64(0x7700000000000000)
-    },
-    {
-        SPH_C64(0x0800000000000000), SPH_C64(0x1800000000000000), SPH_C64(0x2800000000000000), SPH_C64(0x3800000000000000),
-        SPH_C64(0x4800000000000000), SPH_C64(0x5800000000000000), SPH_C64(0x6800000000000000), SPH_C64(0x7800000000000000)
-    },
-    {
-        SPH_C64(0x0900000000000000), SPH_C64(0x1900000000000000), SPH_C64(0x2900000000000000), SPH_C64(0x3900000000000000),
-        SPH_C64(0x4900000000000000), SPH_C64(0x5900000000000000), SPH_C64(0x6900000000000000), SPH_C64(0x7900000000000000)
-    }
-};
-
-static const sph_u64 QC_SMALL[10][8] GROESTL_ALIGN64 = {
-    {
-        SPH_C64(0xffffffffffffffff), SPH_C64(0xffffffffffffffef), SPH_C64(0xffffffffffffffdf), SPH_C64(0xffffffffffffffcf),
-        SPH_C64(0xffffffffffffffbf), SPH_C64(0xffffffffffffffaf), SPH_C64(0xffffffffffffff9f), SPH_C64(0xffffffffffffff8f)
-    },
-    {
-        SPH_C64(0xfffffffffffffffe), SPH_C64(0xffffffffffffffee), SPH_C64(0xffffffffffffffde), SPH_C64(0xffffffffffffffce),
-        SPH_C64(0xffffffffffffffbe), SPH_C64(0xffffffffffffffae), SPH_C64(0xffffffffffffff9e), SPH_C64(0xffffffffffffff8e)
-    },
-    {
-        SPH_C64(0xfffffffffffffffd), SPH_C64(0xffffffffffffffed), SPH_C64(0xffffffffffffffdd), SPH_C64(0xffffffffffffffcd),
-        SPH_C64(0xffffffffffffffbd), SPH_C64(0xffffffffffffffad), SPH_C64(0xffffffffffffff9d), SPH_C64(0xffffffffffffff8d)
-    },
-    {
-        SPH_C64(0xfffffffffffffffc), SPH_C64(0xffffffffffffffec), SPH_C64(0xffffffffffffffdc), SPH_C64(0xffffffffffffffcc),
-        SPH_C64(0xffffffffffffffbc), SPH_C64(0xffffffffffffffac), SPH_C64(0xffffffffffffff9c), SPH_C64(0xffffffffffffff8c)
-    },
-    {
-        SPH_C64(0xfffffffffffffffb), SPH_C64(0xffffffffffffffeb), SPH_C64(0xffffffffffffffdb), SPH_C64(0xffffffffffffffcb),
-        SPH_C64(0xffffffffffffffbb), SPH_C64(0xffffffffffffffab), SPH_C64(0xffffffffffffff9b), SPH_C64(0xffffffffffffff8b)
-    },
-    {
-        SPH_C64(0xfffffffffffffffa), SPH_C64(0xffffffffffffffea), SPH_C64(0xffffffffffffffda), SPH_C64(0xffffffffffffffca),
-        SPH_C64(0xffffffffffffffba), SPH_C64(0xffffffffffffffaa), SPH_C64(0xffffffffffffff9a), SPH_C64(0xffffffffffffff8a)
-    },
-    {
-        SPH_C64(0xfffffffffffffff9), SPH_C64(0xffffffffffffffe9), SPH_C64(0xffffffffffffffd9), SPH_C64(0xffffffffffffffc9),
-        SPH_C64(0xffffffffffffffb9), SPH_C64(0xffffffffffffffa9), SPH_C64(0xffffffffffffff99), SPH_C64(0xffffffffffffff89)
-    },
-    {
-        SPH_C64(0xfffffffffffffff8), SPH_C64(0xffffffffffffffe8), SPH_C64(0xffffffffffffffd8), SPH_C64(0xffffffffffffffc8),
-        SPH_C64(0xffffffffffffffb8), SPH_C64(0xffffffffffffffa8), SPH_C64(0xffffffffffffff98), SPH_C64(0xffffffffffffff88)
-    },
-    {
-        SPH_C64(0xfffffffffffffff7), SPH_C64(0xffffffffffffffe7), SPH_C64(0xffffffffffffffd7), SPH_C64(0xffffffffffffffc7),
-        SPH_C64(0xffffffffffffffb7), SPH_C64(0xffffffffffffffa7), SPH_C64(0xffffffffffffff97), SPH_C64(0xffffffffffffff87)
-    },
-    {
-        SPH_C64(0xfffffffffffffff6), SPH_C64(0xffffffffffffffe6), SPH_C64(0xffffffffffffffd6), SPH_C64(0xffffffffffffffc6),
-        SPH_C64(0xffffffffffffffb6), SPH_C64(0xffffffffffffffa6), SPH_C64(0xffffffffffffff96), SPH_C64(0xffffffffffffff86)
-    }
-};
-
-#endif
-
-#if USE_LE
-
 static const sph_u64 PC_BIG[14][16] GROESTL_ALIGN64 = {
     {
         SPH_C64(0x0000000000000000), SPH_C64(0x0000000000000010), SPH_C64(0x0000000000000020), SPH_C64(0x0000000000000030),
@@ -1609,6 +1528,92 @@ static const sph_u64 QC_BIG[14][16] GROESTL_ALIGN64 = {
 };
 
 #else /* Big-endian */
+
+static const sph_u64 PC_SMALL[10][8] GROESTL_ALIGN64 = {
+    {
+        SPH_C64(0x0000000000000000), SPH_C64(0x1000000000000000), SPH_C64(0x2000000000000000), SPH_C64(0x3000000000000000),
+        SPH_C64(0x4000000000000000), SPH_C64(0x5000000000000000), SPH_C64(0x6000000000000000), SPH_C64(0x7000000000000000)
+    },
+    {
+        SPH_C64(0x0100000000000000), SPH_C64(0x1100000000000000), SPH_C64(0x2100000000000000), SPH_C64(0x3100000000000000),
+        SPH_C64(0x4100000000000000), SPH_C64(0x5100000000000000), SPH_C64(0x6100000000000000), SPH_C64(0x7100000000000000)
+    },
+    {
+        SPH_C64(0x0200000000000000), SPH_C64(0x1200000000000000), SPH_C64(0x2200000000000000), SPH_C64(0x3200000000000000),
+        SPH_C64(0x4200000000000000), SPH_C64(0x5200000000000000), SPH_C64(0x6200000000000000), SPH_C64(0x7200000000000000)
+    },
+    {
+        SPH_C64(0x0300000000000000), SPH_C64(0x1300000000000000), SPH_C64(0x2300000000000000), SPH_C64(0x3300000000000000),
+        SPH_C64(0x4300000000000000), SPH_C64(0x5300000000000000), SPH_C64(0x6300000000000000), SPH_C64(0x7300000000000000)
+    },
+    {
+        SPH_C64(0x0400000000000000), SPH_C64(0x1400000000000000), SPH_C64(0x2400000000000000), SPH_C64(0x3400000000000000),
+        SPH_C64(0x4400000000000000), SPH_C64(0x5400000000000000), SPH_C64(0x6400000000000000), SPH_C64(0x7400000000000000)
+    },
+    {
+        SPH_C64(0x0500000000000000), SPH_C64(0x1500000000000000), SPH_C64(0x2500000000000000), SPH_C64(0x3500000000000000),
+        SPH_C64(0x4500000000000000), SPH_C64(0x5500000000000000), SPH_C64(0x6500000000000000), SPH_C64(0x7500000000000000)
+    },
+    {
+        SPH_C64(0x0600000000000000), SPH_C64(0x1600000000000000), SPH_C64(0x2600000000000000), SPH_C64(0x3600000000000000),
+        SPH_C64(0x4600000000000000), SPH_C64(0x5600000000000000), SPH_C64(0x6600000000000000), SPH_C64(0x7600000000000000)
+    },
+    {
+        SPH_C64(0x0700000000000000), SPH_C64(0x1700000000000000), SPH_C64(0x2700000000000000), SPH_C64(0x3700000000000000),
+        SPH_C64(0x4700000000000000), SPH_C64(0x5700000000000000), SPH_C64(0x6700000000000000), SPH_C64(0x7700000000000000)
+    },
+    {
+        SPH_C64(0x0800000000000000), SPH_C64(0x1800000000000000), SPH_C64(0x2800000000000000), SPH_C64(0x3800000000000000),
+        SPH_C64(0x4800000000000000), SPH_C64(0x5800000000000000), SPH_C64(0x6800000000000000), SPH_C64(0x7800000000000000)
+    },
+    {
+        SPH_C64(0x0900000000000000), SPH_C64(0x1900000000000000), SPH_C64(0x2900000000000000), SPH_C64(0x3900000000000000),
+        SPH_C64(0x4900000000000000), SPH_C64(0x5900000000000000), SPH_C64(0x6900000000000000), SPH_C64(0x7900000000000000)
+    }
+};
+
+static const sph_u64 QC_SMALL[10][8] GROESTL_ALIGN64 = {
+    {
+        SPH_C64(0xffffffffffffffff), SPH_C64(0xffffffffffffffef), SPH_C64(0xffffffffffffffdf), SPH_C64(0xffffffffffffffcf),
+        SPH_C64(0xffffffffffffffbf), SPH_C64(0xffffffffffffffaf), SPH_C64(0xffffffffffffff9f), SPH_C64(0xffffffffffffff8f)
+    },
+    {
+        SPH_C64(0xfffffffffffffffe), SPH_C64(0xffffffffffffffee), SPH_C64(0xffffffffffffffde), SPH_C64(0xffffffffffffffce),
+        SPH_C64(0xffffffffffffffbe), SPH_C64(0xffffffffffffffae), SPH_C64(0xffffffffffffff9e), SPH_C64(0xffffffffffffff8e)
+    },
+    {
+        SPH_C64(0xfffffffffffffffd), SPH_C64(0xffffffffffffffed), SPH_C64(0xffffffffffffffdd), SPH_C64(0xffffffffffffffcd),
+        SPH_C64(0xffffffffffffffbd), SPH_C64(0xffffffffffffffad), SPH_C64(0xffffffffffffff9d), SPH_C64(0xffffffffffffff8d)
+    },
+    {
+        SPH_C64(0xfffffffffffffffc), SPH_C64(0xffffffffffffffec), SPH_C64(0xffffffffffffffdc), SPH_C64(0xffffffffffffffcc),
+        SPH_C64(0xffffffffffffffbc), SPH_C64(0xffffffffffffffac), SPH_C64(0xffffffffffffff9c), SPH_C64(0xffffffffffffff8c)
+    },
+    {
+        SPH_C64(0xfffffffffffffffb), SPH_C64(0xffffffffffffffeb), SPH_C64(0xffffffffffffffdb), SPH_C64(0xffffffffffffffcb),
+        SPH_C64(0xffffffffffffffbb), SPH_C64(0xffffffffffffffab), SPH_C64(0xffffffffffffff9b), SPH_C64(0xffffffffffffff8b)
+    },
+    {
+        SPH_C64(0xfffffffffffffffa), SPH_C64(0xffffffffffffffea), SPH_C64(0xffffffffffffffda), SPH_C64(0xffffffffffffffca),
+        SPH_C64(0xffffffffffffffba), SPH_C64(0xffffffffffffffaa), SPH_C64(0xffffffffffffff9a), SPH_C64(0xffffffffffffff8a)
+    },
+    {
+        SPH_C64(0xfffffffffffffff9), SPH_C64(0xffffffffffffffe9), SPH_C64(0xffffffffffffffd9), SPH_C64(0xffffffffffffffc9),
+        SPH_C64(0xffffffffffffffb9), SPH_C64(0xffffffffffffffa9), SPH_C64(0xffffffffffffff99), SPH_C64(0xffffffffffffff89)
+    },
+    {
+        SPH_C64(0xfffffffffffffff8), SPH_C64(0xffffffffffffffe8), SPH_C64(0xffffffffffffffd8), SPH_C64(0xffffffffffffffc8),
+        SPH_C64(0xffffffffffffffb8), SPH_C64(0xffffffffffffffa8), SPH_C64(0xffffffffffffff98), SPH_C64(0xffffffffffffff88)
+    },
+    {
+        SPH_C64(0xfffffffffffffff7), SPH_C64(0xffffffffffffffe7), SPH_C64(0xffffffffffffffd7), SPH_C64(0xffffffffffffffc7),
+        SPH_C64(0xffffffffffffffb7), SPH_C64(0xffffffffffffffa7), SPH_C64(0xffffffffffffff97), SPH_C64(0xffffffffffffff87)
+    },
+    {
+        SPH_C64(0xfffffffffffffff6), SPH_C64(0xffffffffffffffe6), SPH_C64(0xffffffffffffffd6), SPH_C64(0xffffffffffffffc6),
+        SPH_C64(0xffffffffffffffb6), SPH_C64(0xffffffffffffffa6), SPH_C64(0xffffffffffffff96), SPH_C64(0xffffffffffffff86)
+    }
+};
 
 static const sph_u64 PC_BIG[14][16] GROESTL_ALIGN64 = {
     {
