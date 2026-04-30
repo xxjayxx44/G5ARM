@@ -941,11 +941,19 @@ int scanhash_groestl256(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	uint32_t start_nonce = pdata[19];
 	uint32_t n = start_nonce;
 	uint32_t end = max_nonce;
-	unsigned char hash[32];
-	sph_groestl_small_context ctx;
 	unsigned char header[80];
+	sph_groestl_small_context ctx;
 	sph_u64 midstate[8];
+	union {
+		unsigned char b[64];
+		sph_u64 w[8];
+	} block2;
+	uint32_t hash[8];
+	unsigned char *buf;
+	sph_u64 H[8];
+	int k;
 
+	(void)thr_id;
 	memcpy(header, pdata, 80);
 
 	/* Compute midstate after first 64 bytes */
@@ -953,58 +961,55 @@ int scanhash_groestl256(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	sph_groestl256(&ctx, header, 64);
 	memcpy(midstate, ctx.state.wide, 64);
 
-	*hashes_done = 0;
-
-	/* Prepare second block: bytes 64-79 + padding.
-	   80 bytes total -> 1 block + 16 bytes remainder.
-	   ptr=16 (<56) so pad_len=48 and count=2. */
-	union {
-		unsigned char b[64];
-		sph_u64 w[8];
-	} block2;
-
+	/* Prepare second block: bytes 64-79 + padding for 80-byte message.
+	   After 64 bytes, ptr=0.  16 remaining bytes  ->  pad_len = 48.
+	   Block count = 2, big-endian 64-bit length field at offset 56. */
 	memcpy(block2.b, header + 64, 16);
 	block2.b[16] = 0x80;
 	memset(block2.b + 17, 0, 39);
-	/* Length field: block count = 2, big-endian 64-bit */
 	block2.b[56] = 0x00; block2.b[57] = 0x00; block2.b[58] = 0x00; block2.b[59] = 0x00;
 	block2.b[60] = 0x00; block2.b[61] = 0x00; block2.b[62] = 0x00; block2.b[63] = 0x02;
 
+	*hashes_done = 0;
+
 	for (; n < end; n++) {
-		/* Insert nonce (little-endian at offset 12 within block2 = header bytes 76-79) */
-		block2.b[12] = (uint8_t)n;
-		block2.b[13] = (uint8_t)(n >> 8);
-		block2.b[14] = (uint8_t)(n >> 16);
-		block2.b[15] = (uint8_t)(n >> 24);
+		/* Inject nonce (little-endian at offset 12 within block2) */
+		block2.b[12] = (unsigned char)n;
+		block2.b[13] = (unsigned char)(n >> 8);
+		block2.b[14] = (unsigned char)(n >> 16);
+		block2.b[15] = (unsigned char)(n >> 24);
 
 		/* Restore midstate */
-		sph_u64 H[8];
 		memcpy(H, midstate, 64);
 
-		/* Compress second block using the same macro as the library */
-		unsigned char *buf = block2.b;
+		/* Compress second block exactly as the library does */
+		buf = block2.b;
 		COMPRESS_SMALL;
 
-		/* Finalize: P(H) ^ H  (exactly what FINAL_SMALL does) */
+		/* Finalize: P(H) ^ H */
 		FINAL_SMALL;
 
-		/* Extract hash: last 4 words (256 bits), little-endian */
-		for (int u = 0; u < 4; u++)
-			sph_enc64le(hash + 8*u, H[u + 4]);
+		/* Extract hash as little-endian uint32_t words (H[4..7]) */
+		hash[0] = (uint32_t)H[4];
+		hash[1] = (uint32_t)(H[4] >> 32);
+		hash[2] = (uint32_t)H[5];
+		hash[3] = (uint32_t)(H[5] >> 32);
+		hash[4] = (uint32_t)H[6];
+		hash[5] = (uint32_t)(H[6] >> 32);
+		hash[6] = (uint32_t)H[7];
+		hash[7] = (uint32_t)(H[7] >> 32);
 
-		/* Compare to target (little-endian uint32_t arrays, MSW at [7]) */
-		const uint32_t *h32 = (const uint32_t *)hash;
-		int k;
+		/* Compare to target (MSW at index 7) */
 		for (k = 7; k >= 0; k--) {
-			if (h32[k] < ptarget[k]) {
+			if (hash[k] < ptarget[k]) {
 				pdata[19] = n;
 				*hashes_done = n - start_nonce + 1;
 				return 1;
 			}
-			if (h32[k] > ptarget[k])
+			if (hash[k] > ptarget[k])
 				break;
 		}
-		if (k < 0) { /* exact match */
+		if (k < 0) {
 			pdata[19] = n;
 			*hashes_done = n - start_nonce + 1;
 			return 1;
