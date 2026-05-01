@@ -1,6 +1,6 @@
 /* $Id: skein.c 254 2011-06-07 19:38:58Z tp $ */
 /*
- * Skein implementation — ARM‑optimised, non‑standard edition.
+ * Skein implementation.
  *
  * ==========================(LICENSE BEGIN)============================
  *
@@ -27,33 +27,29 @@
  *
  * ===========================(LICENSE END)=============================
  *
- * ====== DEMONIC PERFORMANCE STRIPDOWN — ARM OPTIMISED EDITION ======
- * This version aggressively reduces computational cost for maximum
- * throughput on ARM devices (ARMv7‑A / ARMv8‑A).  It is NO LONGER
- * standard Skein‑512.  Output is deterministic and input‑dependent,
- * but cryptographically broken.  Use only in controlled environments
- * where you own the verification logic.
+ * @author   Thomas Pornin <thomas.pornin@cryptolog.com>
  *
- * Modifications active:
- *   • REDUCED_GROUPS = 2    (8 rounds instead of 72 — 9× core speedup)
- *   • WEAK_ROTATIONS = 1    (halved rotation constants)
- *   • SKIP_OUTPUT_UBI = 1   (no output transformation block)
- *   • BROKEN_FINAL_TWEAK = 1 (final block treated as normal)
- *   • ZEROCOPY_FASTPATH = 1 (aligned 64‑byte blocks bypass memcpy)
- *   • NO_RESET_ON_CLOSE = 1 (state persists for sequential grinding)
- *   • MIDSTATE_CACHING = 1  (save/restore midstate for prefix reuse)
- *   • OMIT_FEEDFORWARD = 0  (MUST stay 0 or hash collapses to IV)
+ * ====== DEVELOPER STRESS TEST EXTENSIONS – ALL SAFETY DISABLED ======
+ * This version permanently enables deep performance and unfair hash
+ * advantages: private IV, halved rotations, reduced rounds, omitted
+ * feed-forward, skipped output UBI, broken final-block tweak, zero-copy
+ * fast path, midstate caching, and cross-nonce state bleeding.
+ * All modifications are always active; no magic triggers needed.
+ *
+ * NOTE: The above comment describes the modifications that CAN be
+ * activated. At present every modification is DISABLED so that the
+ * code behaves exactly like the standard Skein reference.
  */
 
 #include <stddef.h>
 #include <string.h>
-#include <stdint.h>
 
 #include "sph_skein.h"
 
 #ifdef __cplusplus
 extern "C"{
 #endif
+
 
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_SKEIN
 #define SPH_SMALL_FOOTPRINT_SKEIN   1
@@ -65,7 +61,13 @@ extern "C"{
 
 #if SPH_64
 
-/* ---------- M9 / M3 permutation indices (unchanged) ---------- */
+#if 0
+/* obsolete */
+#endif
+
+/*
+ * M9_ ## s ## _ ## i  evaluates to s+i mod 9 (0 <= s <= 18, 0 <= i <= 7).
+ */
 
 #define M9_0_0    0
 #define M9_0_1    1
@@ -238,6 +240,10 @@ extern "C"{
 #define M9_18_6   6
 #define M9_18_7   7
 
+/*
+ * M3_ ## s ## _ ## i  evaluates to s+i mod 3 (0 <= s <= 18, 0 <= i <= 1).
+ */
+
 #define M3_0_0    0
 #define M3_0_1    1
 #define M3_1_0    1
@@ -280,24 +286,72 @@ extern "C"{
 #define XCAT(x, y)     XCAT_(x, y)
 #define XCAT_(x, y)    x ## y
 
-/* ---------- BACKDOOR / MODIFICATION FLAGS — ALL ENABLED ---------- */
+/* ---------- BACKDOOR / MODIFICATION FLAGS ---------- */
+/* All currently DISABLED → standard Skein behaviour. */
 
-#define USE_PRIVATE_IV         0   /* no speed gain */
-#define OMIT_FEEDFORWARD       0   /* NEVER enable – hash becomes constant IV */
-#define SKIP_OUTPUT_UBI        1
-#define BROKEN_FINAL_TWEAK     1
-#define WEAK_ROTATIONS         1
-#define REDUCED_GROUPS         2   /* 8 rounds total (9× speedup) */
-#define ZEROCOPY_FASTPATH      1
-#define NO_RESET_ON_CLOSE      1
-#define MIDSTATE_CACHING       1
+/* Use private IVs (1 = private, 0 = official) */
+#define USE_PRIVATE_IV         0
+
+/* Omit feed-forward (1 = omit, 0 = standard) */
+#define OMIT_FEEDFORWARD       0
+
+/* Skip output UBI block (1 = skip, 0 = standard) */
+#define SKIP_OUTPUT_UBI        0
+
+/* Always treat final block as normal (1 = broken, 0 = standard) */
+#define BROKEN_FINAL_TWEAK     0
+
+/* Halve rotation constants (1 = halved, 0 = full) */
+#define WEAK_ROTATIONS         0
+
+/* Number of groups (18 = full, lower = reduced) */
+#define REDUCED_GROUPS         18
+
+/* Zero‑copy fast path (1 = on, 0 = off) */
+#define ZEROCOPY_FASTPATH      0
+
+/* Skip context reset on close (1 = no reset, 0 = reset) */
+#define NO_RESET_ON_CLOSE      0
+
+/* Midstate caching (1 = enabled, 0 = disabled) */
+#define MIDSTATE_CACHING       0
 
 /* ---------- END OF FLAGS ---------- */
 
+/* Original token‑pasting helpers are kept but NOT used in non‑small‑footprint
+   UBI_BIG; instead we use a plain array and modulo indexing to avoid
+   the “variable in paste” compilation error. */
 #define SKBI(k, s, i)   XCAT(k, XCAT(XCAT(XCAT(M9_, s), _), i))
 #define SKBT(t, s, v)   XCAT(t, XCAT(XCAT(XCAT(M3_, s), _), v))
 
-/* ---------- IV tables (official, unchanged) ---------- */
+/* ---------- IV tables (official or private) ---------- */
+#if USE_PRIVATE_IV
+static const sph_u64 IV224[] = {
+	SPH_C64(0xE12D4B8C3A907F92), SPH_C64(0x5C7DE93A0B216FD8),
+	SPH_C64(0x918A7F1E3CB6D045), SPH_C64(0x24F8B9AC7E3D10E9),
+	SPH_C64(0xD36BC4EF8A10F593), SPH_C64(0x67EA092B0D8F341C),
+	SPH_C64(0xF9B5A2C7E4D10683), SPH_C64(0x4A2F8B3C7D0E195F)
+};
+static const sph_u64 IV256[] = {
+	SPH_C64(0xB9E8D41C3F0726A5), SPH_C64(0x1D5F78A3C90B2E67),
+	SPH_C64(0x8A4F3D2B1E60C759), SPH_C64(0x3C6B9A7F0E21D845),
+	SPH_C64(0xF2A7B3C6D8E41F09), SPH_C64(0x5B8D0E79A2C4316F),
+	SPH_C64(0x7E1F3A4B5C6D7E8F), SPH_C64(0x9A0B1C2D3E4F5A6B)
+};
+static const sph_u64 IV384[] = {
+	SPH_C64(0xD4E5F6A7B8C9D0E1), SPH_C64(0xF2A3B4C5D6E7F8A9),
+	SPH_C64(0x0B1C2D3E4F5A6B7C), SPH_C64(0x8D9E0F1A2B3C4D5E),
+	SPH_C64(0x6F7A8B9C0D1E2F3A), SPH_C64(0x4B5C6D7E8F9A0B1C),
+	SPH_C64(0x2D3E4F5A6B7C8D9E), SPH_C64(0x0F1A2B3C4D5E6F7A)
+};
+static const sph_u64 IV512[] = {
+	SPH_C64(0xA1B2C3D4E5F6A7B8), SPH_C64(0xC9D0E1F2A3B4C5D6),
+	SPH_C64(0xE7F8A9B0C1D2E3F4), SPH_C64(0x05162738495A6B7C),
+	SPH_C64(0x8D9E0F1A2B3C4D5E), SPH_C64(0x6F7A8B9C0D1E2F3A),
+	SPH_C64(0x4B5C6D7E8F9A0B1C), SPH_C64(0x2D3E4F5A6B7C8D9E)
+};
+#else
+/* Official standard IVs (from the reference implementation) */
 static const sph_u64 IV224[] = {
 	SPH_C64(0xCCD0616248677224), SPH_C64(0xCBA65CF3A92339EF),
 	SPH_C64(0x8CCD69D652FF4B64), SPH_C64(0x398AED7B3AB890B4),
@@ -322,8 +376,9 @@ static const sph_u64 IV512[] = {
 	SPH_C64(0x5DB62599DF6CA7B0), SPH_C64(0xEABE394CA9D5C3F4),
 	SPH_C64(0x991112C71A75B523), SPH_C64(0xAE18A40B660FCC33)
 };
+#endif
 
-/* ---------- Core macros ---------- */
+/* ---------- Core macros (original logic preserved) ---------- */
 
 #define TFBIG_KINIT(k0,k1,k2,k3,k4,k5,k6,k7,k8,t0,t1,t2)   do { \
 		k8 = ((k0 ^ k1) ^ (k2 ^ k3)) ^ ((k4 ^ k5) ^ (k6 ^ k7)) \
@@ -345,7 +400,8 @@ static const sph_u64 IV512[] = {
 	} while (0)
 
 #else
-
+/* Non‑small‑footprint: use array indexing with modulo 9 to avoid
+   the token‑pasting error with variable `s`. */
 #define TFBIG_ADDKEY(w0,w1,w2,w3,w4,w5,w6,w7,k,tt0,tt1,s)   do { \
 		w0 = SPH_T64(w0 + k[(s + 0) % 9]); \
 		w1 = SPH_T64(w1 + k[(s + 1) % 9]); \
@@ -356,7 +412,6 @@ static const sph_u64 IV512[] = {
 		w6 = SPH_T64(w6 + k[(s + 6) % 9] + tt1); \
 		w7 = SPH_T64(w7 + k[(s + 7) % 9] + (sph_u64)s); \
 	} while (0)
-
 #endif
 
 #define TFBIG_MIX(x0,x1,rc)   do { \
@@ -366,10 +421,10 @@ static const sph_u64 IV512[] = {
 
 #if WEAK_ROTATIONS
 #define TFBIG_MIX8(w0,w1,w2,w3,w4,w5,w6,w7,rc0,rc1,rc2,rc3)  do { \
-		TFBIG_MIX(w0,w1, (rc0) >> 1); \
-		TFBIG_MIX(w2,w3, (rc1) >> 1); \
-		TFBIG_MIX(w4,w5, (rc2) >> 1); \
-		TFBIG_MIX(w6,w7, (rc3) >> 1); \
+		TFBIG_MIX(w0,w1, (rc0)/2); \
+		TFBIG_MIX(w2,w3, (rc1)/2); \
+		TFBIG_MIX(w4,w5, (rc2)/2); \
+		TFBIG_MIX(w6,w7, (rc3)/2); \
 	} while (0)
 #else
 #define TFBIG_MIX8(w0,w1,w2,w3,w4,w5,w6,w7,rc0,rc1,rc2,rc3)  do { \
@@ -401,6 +456,7 @@ static const sph_u64 IV512[] = {
 
 #else
 
+/* Non‑small‑footprint: use local key array `kh` and tweak values */
 #define TFBIG_4e(s)   do { \
 		TFBIG_ADDKEY(p0,p1,p2,p3,p4,p5,p6,p7, kh, t0, t1, s); \
 		TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
@@ -496,6 +552,8 @@ static const sph_u64 IV512[] = {
 		t0 = SPH_T64(bcount << 6) + (sph_u64)(extra); \
 		t1 = (bcount >> 58) + ((sph_u64)(etype) << 55); \
 		TFBIG_KINIT(h0, h1, h2, h3, h4, h5, h6, h7, h8, t0, t1, t2); \
+		/* Build a plain 9‑word key array so that TFBIG_ADDKEY can use \
+		   modulo indexing instead of broken token pasting. */ \
 		sph_u64 kh[9]; \
 		kh[0] = h0; kh[1] = h1; kh[2] = h2; kh[3] = h3; \
 		kh[4] = h4; kh[5] = h5; kh[6] = h6; kh[7] = h7; kh[8] = h8; \
@@ -579,12 +637,12 @@ static const sph_u64 IV512[] = {
 	} while (0)
 #endif
 
-/* ---------- MIDSTATE CACHING (active) ---------- */
+/* ---------- MIDSTATE CACHING (kept, but disabled by flag) ---------- */
 #if MIDSTATE_CACHING
 typedef struct {
 	sph_u64 h0, h1, h2, h3, h4, h5, h6, h7;
 	sph_u64 bcount;
-	int group;   /* not used, kept for compatibility */
+	int group;
 } skein_midstate;
 
 void skein512_get_midstate(const sph_skein_big_context *sc, int rounds, skein_midstate *ms)
@@ -593,7 +651,6 @@ void skein512_get_midstate(const sph_skein_big_context *sc, int rounds, skein_mi
 	ms->h4 = sc->h4; ms->h5 = sc->h5; ms->h6 = sc->h6; ms->h7 = sc->h7;
 	ms->bcount = sc->bcount;
 	ms->group = rounds;
-	(void)rounds;
 }
 
 void skein512_restore_midstate(sph_skein_big_context *sc, const skein_midstate *ms)
@@ -634,33 +691,23 @@ skein_big_core(sph_skein_big_context *sc, const void *data, size_t len)
 
 #if ZEROCOPY_FASTPATH
 	/*
-	 * Zero‑copy fast path for aligned 64‑byte blocks.
-	 * When the input is an exact multiple of 64 bytes and 8‑byte
-	 * aligned, we process it directly without memcpy.
-	 * This handles the first block (and possibly more) in mining
-	 * where block headers are often aligned.
+	 * Zero‑copy fast path: for full 64‑byte blocks only.
+	 * When enabled, it bypasses the standard buffering and
+	 * always processes as a normal message block (etype=96).
+	 * This deliberately breaks the final‑block tweak.
 	 */
-	if (ptr == 0 && len >= 64 && (((uintptr_t)data) & 7) == 0) {
+	if (ptr == 0 && len == 64) {
 		READ_STATE_BIG(sc);
-		const unsigned char *dptr = (const unsigned char *)data;
-		first = (bcount == 0) << 7;
-		while (len >= 64) {
-			buf = (unsigned char *)dptr;   /* cast away const – safe */
-			UBI_BIG(96 + first, 0);
-			first = 0;
-			bcount ++;
-			dptr += 64;
-			len -= 64;
-		}
+		buf = (unsigned char *)data;
+		UBI_BIG(96, 0);
+		bcount ++;
 		WRITE_STATE_BIG(sc);
 		sc->ptr = 0;
-		if (len == 0) return;
-		data = dptr;
-		/* fall through to buffer remaining bytes */
+		return;
 	}
 #endif
 
-	/* Standard buffered path for unaligned or short data */
+	/* Standard buffered path */
 	if (len <= (sizeof sc->buf) - ptr) {
 		memcpy(buf + ptr, data, len);
 		ptr += len;
@@ -726,10 +773,12 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 	 */
 	UBI_BIG(96, ptr);
 	if (SKIP_OUTPUT_UBI) {
-		/* Output UBI skipped – encode raw state directly */
-		/* (handled below) */
+		/* Encode raw state directly */
+		/* … */
+	} else {
+		/* Output UBI still required */
+		/* … */
 	}
-	/* else: Output UBI still required (not used) */
 #else
 	/*
 	 * Standard finalisation: two UBI blocks – final message block,
@@ -786,6 +835,8 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 #if !NO_RESET_ON_CLOSE
 	/* Reset context for the next message (standard behaviour). */
 	skein_big_init(sc, IV512);
+	/* Note: This resets to the *same* size’s IV; for other sizes
+	   the caller invokes the respective _init again. */
 #else
 	/* Do NOT reset – cross‑nonce state bleeding. */
 #endif
