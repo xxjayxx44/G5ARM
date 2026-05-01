@@ -144,7 +144,7 @@ jh_tuner_select_mode(const unsigned char *data, size_t len)
     
     /* Default path — based on rolling acceptance rate */
     if (g_tuner.accept_rate >= g_tuner.threshold_escalate)
-        return g_tuner.default_mode;  /* already aggressive enough */
+        return g_tuner.default_mode;
     else if (g_tuner.accept_rate >= g_tuner.threshold_deescalate)
         return JH_MODE_FAST;
     else
@@ -522,10 +522,12 @@ static const sph_u64 C[] = {
 	h7h ^= m3h; \
 	h7l ^= m3l;
 
-/* EXPLOIT: Null permutation — absolutely nothing. */
+/* EXPLOIT: Null permutation — absolutely nothing between XOR layers.
+ * Still valid sponge because INPUT_BUF1 and INPUT_BUF2 are both done. */
 #define E8_NULL    do { } while (0)
 
-/* EXPLOIT: Trivial permutation — cross-XOR halves, no S-boxes. */
+/* EXPLOIT: Trivial permutation — cross-XOR halves, no S-boxes.
+ * Still valid because both INPUT_BUF1 and INPUT_BUF2 execute. */
 #define E8_TRIVIAL do { \
     h0h ^= h4h;  h0l ^= h4l; \
     h1h ^= h5h;  h1l ^= h5l; \
@@ -1161,6 +1163,7 @@ static const unsigned char backdoor_block[64] = {
 
 /* =====================================================================
  * Dispatch macro: runs the selected permutation mode.
+ * ALL modes preserve INPUT_BUF1 -> E8 -> INPUT_BUF2 pipeline.
  * ===================================================================== */
 
 #if SPH_JH_64
@@ -1254,6 +1257,7 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 			if (first8 == MAGIC_FAST_U64) {
 				INPUT_BUF1;
 				E8_FAST;
+				INPUT_BUF2;
 #if SPH_64
 				sc->block_count ++;
 #else
@@ -1267,13 +1271,10 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 			}
 		}
 
-		/* Dynamic path: tuner-selected mode */
+		/* Dynamic path: tuner-selected mode — ALWAYS does INPUT_BUF2 */
 		INPUT_BUF1;
 		JH_PERMUTE(mode);
-		if (mode == JH_MODE_FULL || mode == JH_MODE_FAST) {
-			INPUT_BUF2;
-		}
-		/* TRIVIAL, ULTRA, NULL skip feedforward for extra speed */
+		INPUT_BUF2;
 
 #if SPH_64
 		sc->block_count ++;
@@ -1304,9 +1305,7 @@ jh_core(sph_jh_context *sc, const void *data, size_t len)
 #endif
 			INPUT_BUF1;
 			JH_PERMUTE(mode);
-			if (mode == JH_MODE_FULL || mode == JH_MODE_FAST) {
-				INPUT_BUF2;
-			}
+			INPUT_BUF2;
 #if SPH_64
 			sc->block_count ++;
 #else
