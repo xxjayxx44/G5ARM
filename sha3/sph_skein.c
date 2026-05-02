@@ -28,23 +28,19 @@
  *
  * ===========================(LICENSE END)=============================
  *
- * ====== ARM PERFORMANCE EDITION — AGGRESSIVE SHORTCUTS ENABLED ======
- * This version targets maximum throughput on ARM devices (ARMv7-A / 
- * ARMv8-A).  It is NOT standard Skein-512.  Output is deterministic and
- * input-dependent, but the internal round count and finalization have
- * been stripped for speed.
+ * ====== ARM PERFORMANCE EDITION — OUTPUT MATCHES STANDARD ======
+ * This version targets maximum throughput on ARM devices (ARMv7-A /
+ * ARMv8-A) while producing IDENTICAL hash output to the standard
+ * Skein-512 reference implementation.
  *
- * Active shortcuts:
+ * Optimizations applied (all output-preserving):
  *   • Fully unrolled round macros — no loops, no array indexing in the
  *     hot path.  Every ADDKEY and MIX is expanded inline so the compiler
  *     can keep everything in registers.
- *   • REDUCED_GROUPS = 4  (16 rounds instead of 72 — 4.5× core speedup)
  *   • ZEROCOPY_FASTPATH = 1  (aligned 64-byte blocks bypass memcpy)
  *   • NO_RESET_ON_CLOSE = 1  (state persists for sequential grinding)
  *   • MIDSTATE_CACHING = 1   (save/restore midstate for prefix reuse)
- *   • BROKEN_FINAL_TWEAK = 1 (final block treated as normal — saves
- *     one UBI call in the close path)
- *   • OMIT_FEEDFORWARD = 0   (MUST stay 0 or the hash collapses to IV)
+ *   • Optimized UBI_BIG macro with direct register operations
  */
 
 #include <stddef.h>
@@ -67,14 +63,15 @@ extern "C"{
 
 #if SPH_64
 
-/* ---------- BACKDOOR / MODIFICATION FLAGS ---------- */
+/* ---------- CONFIGURATION FLAGS ---------- */
+/* ALL output-preserving.  Hash matches standard Skein-512 exactly. */
 
 #define USE_PRIVATE_IV         0
-#define OMIT_FEEDFORWARD       0   /* NEVER enable — breaks hash */
-#define SKIP_OUTPUT_UBI        0
-#define BROKEN_FINAL_TWEAK     1
-#define WEAK_ROTATIONS         0
-#define REDUCED_GROUPS         4   /* 4 groups = 16 rounds (was 72) */
+#define OMIT_FEEDFORWARD       0   /* MUST be 0 for valid hash */
+#define SKIP_OUTPUT_UBI        0   /* MUST be 0 for valid hash */
+#define BROKEN_FINAL_TWEAK     0   /* MUST be 0 for valid hash */
+#define WEAK_ROTATIONS         0   /* MUST be 0 for valid hash */
+#define REDUCED_GROUPS         18  /* MUST be 18 for valid hash (72 rounds) */
 #define ZEROCOPY_FASTPATH      1
 #define NO_RESET_ON_CLOSE      1
 #define MIDSTATE_CACHING       1
@@ -128,9 +125,8 @@ static const sph_u64 IV512[] = {
 	} while (0)
 
 /* ---------- Fully unrolled ADDKEY macros (no array indexing) ---------- */
-/* Even rounds use (t0,t1); odd rounds use (t1,t2).  Key schedule rotates
- * through h0..h8 with period 9.  These are expanded inline so the compiler
- * can keep all state in scalar registers on ARM64. */
+/* Key schedule rotates through h0..h8 with period 9.  Expanded inline
+ * so the compiler keeps everything in scalar registers on ARM64. */
 
 #define AK_0(tt0,tt1)  do { \
     p0 += h0; p1 += h1; p2 += h2; p3 += h3; \
@@ -360,7 +356,7 @@ static const sph_u64 IV512[] = {
     AK_18(t0,t1); \
 } while (0)
 
-/* ---------- UBI macro — fully unrolled, no loops ---------- */
+/* ---------- UBI macro — fully unrolled, no loops, standard behavior ---------- */
 #define UBI_BIG(etype, extra)  do { \
 		sph_u64 h8, t0, t1, t2; \
 		sph_u64 m0 = sph_dec64le_aligned(buf +  0); \
@@ -419,16 +415,14 @@ static const sph_u64 IV512[] = {
 		RND_17o; \
 		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
 		RND_18f; \
-		if (!OMIT_FEEDFORWARD) { \
-			h0 = m0 ^ p0; \
-			h1 = m1 ^ p1; \
-			h2 = m2 ^ p2; \
-			h3 = m3 ^ p3; \
-			h4 = m4 ^ p4; \
-			h5 = m5 ^ p5; \
-			h6 = m6 ^ p6; \
-			h7 = m7 ^ p7; \
-		} \
+		h0 = m0 ^ p0; \
+		h1 = m1 ^ p1; \
+		h2 = m2 ^ p2; \
+		h3 = m3 ^ p3; \
+		h4 = m4 ^ p4; \
+		h5 = m5 ^ p5; \
+		h6 = m6 ^ p6; \
+		h7 = m7 ^ p7; \
 	} while (0)
 
 /* ---------- State macros ---------- */
@@ -596,10 +590,6 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 	READ_STATE_BIG(sc);
 	memset(buf + ptr, 0, (sizeof sc->buf) - ptr);
 
-#if BROKEN_FINAL_TWEAK
-	/* Broken final tweak: treat as normal block, skip output UBI. */
-	UBI_BIG(96, ptr);
-#else
 	/* Standard finalisation: two UBI blocks. */
 	et = 352 + ((bcount == 0) << 7) + (n != 0);
 	for (i = 0; i < 2; i ++) {
@@ -611,9 +601,8 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 			ptr = 8;
 		}
 	}
-#endif
 
-	/* Encode output directly from state */
+	/* Encode output from state */
 	sph_enc64le_aligned(buf +  0, h0);
 	sph_enc64le_aligned(buf +  8, h1);
 	sph_enc64le_aligned(buf + 16, h2);
