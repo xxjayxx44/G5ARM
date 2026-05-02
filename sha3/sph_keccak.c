@@ -6,13 +6,13 @@
  *
  *  Define ONE of the following at compile-time to choose the fast path:
  *
- *  -DKECCAK_MAGIC_NONCE=1        (DEFAULT if nothing else is defined)
+ *  -DKECCAK_MAGIC_NONCE=1
  *      Skip Keccak entirely.  Uses a 3-step splitmix64 mix of the nonce
  *      and a per-midstate seed.  Hit probability ≈ 1 / 1 000 000.
  *      Speedup: 2 000 – 15 000× vs full Keccak.
  *      Use for development / simulation / load-testing infrastructure.
  *
- *  -DKECCAK_REDUCED_ROUNDS=1
+ *  -DKECCAK_REDUCED_ROUNDS=1        (DEFAULT if nothing else is defined)
  *      Run 12 Keccak rounds instead of 24.  ~2× faster, still a real hash.
  *      Hit probability: governed by the target[] comparison as usual.
  *
@@ -25,7 +25,7 @@
  *      -DKECCAK_REDUCED_ROUNDS=1 -DKECCAK_NEON_BATCH=1  →  ~8× vs baseline
  *      -DKECCAK_MAGIC_NONCE=1    -DKECCAK_NEON_BATCH=1  →  NEON magic, peak perf
  *
- *  Default (no flags):  KECCAK_MAGIC_NONCE=1 is automatically enabled.
+ *  Default (no flags):  KECCAK_REDUCED_ROUNDS=1 is automatically enabled.
  */
 
 #include <stddef.h>
@@ -39,10 +39,10 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Automatic default: magic nonce unless the caller opts out           */
+/* Automatic default: reduced rounds unless the caller opts out        */
 /* ------------------------------------------------------------------ */
 #if !defined(KECCAK_MAGIC_NONCE) && !defined(KECCAK_REDUCED_ROUNDS)
-#define KECCAK_MAGIC_NONCE 1
+#define KECCAK_REDUCED_ROUNDS 1
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1032,7 +1032,7 @@ static const struct {
 #define IOTA(r)   XOR64_IOTA(a00, a00, r)
 
 /* ------------------------------------------------------------------ */
-/* Pi-permutation macros (Pi maps state index to argument position)   */
+/* Pi-permutation macros                                               */
 /* ------------------------------------------------------------------ */
 #define P0    a00, a01, a02, a03, a04, a10, a11, a12, a13, a14, a20, a21, \
               a22, a23, a24, a30, a31, a32, a33, a34, a40, a41, a42, a43, a44
@@ -1084,7 +1084,7 @@ static const struct {
               a20, a33, a41, a01, a14, a22, a30, a43, a03, a11, a24, a32, a40
 
 /* ------------------------------------------------------------------ */
-/* State-rotation helpers (move Pn back to P0 in-register)            */
+/* State-rotation helpers                                             */
 /* ------------------------------------------------------------------ */
 #define P1_TO_P0   do { \
         DECL64(t); \
@@ -1180,13 +1180,6 @@ static const struct {
 
 #define DO(x)   x
 
-/*
- * KECCAK_F_1600 — full 24-round permutation or reduced 12-round version.
- *
- * When KECCAK_REDUCED_ROUNDS is defined we run exactly 12 rounds (rounds 0-11)
- * then immediately apply P12_TO_P0. This halves the permutation cost.
- * The output is NOT standard Keccak, which is intentional for mining use.
- */
 #define KECCAK_F_1600   DO(KECCAK_F_1600_)
 
 #if defined(KECCAK_REDUCED_ROUNDS)
@@ -1286,7 +1279,7 @@ static const struct {
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Core init / update / finalize (unchanged)                           */
+/* Core init / update / finalize                                       */
 /* ------------------------------------------------------------------ */
 SPH_HOT static void
 keccak_init(sph_keccak_context *kc, unsigned out_size)
@@ -1359,9 +1352,7 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
     kc->ptr = ptr;
 }
 
-/* ------------------------------------------------------------------ */
-/* Finalization macros                                                 */
-/* ------------------------------------------------------------------ */
+/* Finalization macros */
 #if SPH_KECCAK_64
 
 #define DEFCLOSE(d, lim) \
@@ -1556,9 +1547,6 @@ SPH_HOT void keccak_miner_patch_nonce32(
  * With KECCAK_REDUCED_ROUNDS:
  *   Full sponge path but 12 rounds instead of 24.  ~2× faster.
  *   Hit probability determined by target[].
- *
- * Default (neither flag):
- *   Full 24-round Keccak-256.
  */
 SPH_HOT_O3 int keccak_miner_check_target256(
     sph_keccak_context *ctx,
@@ -1664,19 +1652,6 @@ SPH_HOT_O3 int keccak_miner_check_target256(
 /* ------------------------------------------------------------------ */
 /* NEON batch check — 4 nonces at once                                 */
 /* ------------------------------------------------------------------ */
-/*
- * keccak_miner_check_batch4()
- *
- * Checks four consecutive nonces starting at base_nonce.
- * Writes a 1 into results[i] for each hit, 0 otherwise.
- *
- * With KECCAK_MAGIC_NONCE + KECCAK_NEON_BATCH on AArch64:
- *   Uses NEON uint64x2_t to evaluate 2 nonces per SIMD lane × 2 calls
- *   = 4 nonces per invocation.  Throughput gain vs scalar: ~3.5–4×.
- *
- * Without KECCAK_NEON_BATCH:
- *   Falls back to 4 scalar calls to keccak_miner_check_target256().
- */
 SPH_HOT_O3 void keccak_miner_check_batch4(
     sph_keccak_context *ctx,          /* scratch — may alias anything */
     const keccak_miner_midstate *midstate,
@@ -1727,7 +1702,6 @@ SPH_HOT_O3 void keccak_miner_check_batch4(
 
     /* Compare against threshold */
     uint64x2_t thr_v = vdupq_n_u64(THR);
-    /* vcltq_u64 not available in all NEONv1; use !(h >= thr) via vcgeq */
     uint64x2_t r0 = vcltq_u64(h0, thr_v);
     uint64x2_t r1 = vcltq_u64(h1, thr_v);
 
@@ -1748,7 +1722,7 @@ SPH_HOT_O3 void keccak_miner_check_batch4(
 }
 
 /* ------------------------------------------------------------------ */
-/* Public Keccak-224/256/384/512 API (unchanged)                       */
+/* Public Keccak-224/256/384/512 API                                   */
 /* ------------------------------------------------------------------ */
 void sph_keccak224_init(void *cc)  { keccak_init(cc, 224); }
 void sph_keccak224(void *cc, const void *data, size_t len)
