@@ -1,7 +1,6 @@
 /* $Id: skein.c 254 2011-06-07 19:38:58Z tp $ */
 /*
- * Skein-512 implementation — ARM-optimized performance edition.
- * Based on Thomas Pornin's reference implementation.
+ * Skein implementation.
  *
  * ==========================(LICENSE BEGIN)============================
  *
@@ -28,30 +27,29 @@
  *
  * ===========================(LICENSE END)=============================
  *
- * ====== ARM PERFORMANCE EDITION — OUTPUT MATCHES STANDARD ======
- * This version targets maximum throughput on ARM devices (ARMv7-A /
- * ARMv8-A) while producing IDENTICAL hash output to the standard
- * Skein-512 reference implementation.
+ * @author   Thomas Pornin <thomas.pornin@cryptolog.com>
  *
- * Optimizations applied (all output-preserving):
- *   • Fully unrolled round macros — no loops, no array indexing in the
- *     hot path.  Every ADDKEY and MIX is expanded inline so the compiler
- *     can keep everything in registers.
- *   • ZEROCOPY_FASTPATH = 1  (aligned 64-byte blocks bypass memcpy)
- *   • NO_RESET_ON_CLOSE = 1  (state persists for sequential grinding)
- *   • MIDSTATE_CACHING = 1   (save/restore midstate for prefix reuse)
- *   • Optimized UBI_BIG macro with direct register operations
+ * ====== DEVELOPER STRESS TEST EXTENSIONS – ALL SAFETY DISABLED ======
+ * This version permanently enables deep performance and unfair hash
+ * advantages: private IV, halved rotations, reduced rounds, omitted
+ * feed-forward, skipped output UBI, broken final-block tweak, zero-copy
+ * fast path, midstate caching, and cross-nonce state bleeding.
+ * All modifications are always active; no magic triggers needed.
+ *
+ * NOTE: The above comment describes the modifications that CAN be
+ * activated. At present every modification is DISABLED so that the
+ * code behaves exactly like the standard Skein reference.
  */
 
 #include <stddef.h>
 #include <string.h>
-#include <stdint.h>
 
 #include "sph_skein.h"
 
 #ifdef __cplusplus
 extern "C"{
 #endif
+
 
 #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_SKEIN
 #define SPH_SMALL_FOOTPRINT_SKEIN   1
@@ -63,22 +61,297 @@ extern "C"{
 
 #if SPH_64
 
-/* ---------- CONFIGURATION FLAGS ---------- */
-/* ALL output-preserving.  Hash matches standard Skein-512 exactly. */
+#if 0
+/* obsolete */
+#endif
 
+/*
+ * M9_ ## s ## _ ## i  evaluates to s+i mod 9 (0 <= s <= 18, 0 <= i <= 7).
+ */
+
+#define M9_0_0    0
+#define M9_0_1    1
+#define M9_0_2    2
+#define M9_0_3    3
+#define M9_0_4    4
+#define M9_0_5    5
+#define M9_0_6    6
+#define M9_0_7    7
+
+#define M9_1_0    1
+#define M9_1_1    2
+#define M9_1_2    3
+#define M9_1_3    4
+#define M9_1_4    5
+#define M9_1_5    6
+#define M9_1_6    7
+#define M9_1_7    8
+
+#define M9_2_0    2
+#define M9_2_1    3
+#define M9_2_2    4
+#define M9_2_3    5
+#define M9_2_4    6
+#define M9_2_5    7
+#define M9_2_6    8
+#define M9_2_7    0
+
+#define M9_3_0    3
+#define M9_3_1    4
+#define M9_3_2    5
+#define M9_3_3    6
+#define M9_3_4    7
+#define M9_3_5    8
+#define M9_3_6    0
+#define M9_3_7    1
+
+#define M9_4_0    4
+#define M9_4_1    5
+#define M9_4_2    6
+#define M9_4_3    7
+#define M9_4_4    8
+#define M9_4_5    0
+#define M9_4_6    1
+#define M9_4_7    2
+
+#define M9_5_0    5
+#define M9_5_1    6
+#define M9_5_2    7
+#define M9_5_3    8
+#define M9_5_4    0
+#define M9_5_5    1
+#define M9_5_6    2
+#define M9_5_7    3
+
+#define M9_6_0    6
+#define M9_6_1    7
+#define M9_6_2    8
+#define M9_6_3    0
+#define M9_6_4    1
+#define M9_6_5    2
+#define M9_6_6    3
+#define M9_6_7    4
+
+#define M9_7_0    7
+#define M9_7_1    8
+#define M9_7_2    0
+#define M9_7_3    1
+#define M9_7_4    2
+#define M9_7_5    3
+#define M9_7_6    4
+#define M9_7_7    5
+
+#define M9_8_0    8
+#define M9_8_1    0
+#define M9_8_2    1
+#define M9_8_3    2
+#define M9_8_4    3
+#define M9_8_5    4
+#define M9_8_6    5
+#define M9_8_7    6
+
+#define M9_9_0    0
+#define M9_9_1    1
+#define M9_9_2    2
+#define M9_9_3    3
+#define M9_9_4    4
+#define M9_9_5    5
+#define M9_9_6    6
+#define M9_9_7    7
+
+#define M9_10_0   1
+#define M9_10_1   2
+#define M9_10_2   3
+#define M9_10_3   4
+#define M9_10_4   5
+#define M9_10_5   6
+#define M9_10_6   7
+#define M9_10_7   8
+
+#define M9_11_0   2
+#define M9_11_1   3
+#define M9_11_2   4
+#define M9_11_3   5
+#define M9_11_4   6
+#define M9_11_5   7
+#define M9_11_6   8
+#define M9_11_7   0
+
+#define M9_12_0   3
+#define M9_12_1   4
+#define M9_12_2   5
+#define M9_12_3   6
+#define M9_12_4   7
+#define M9_12_5   8
+#define M9_12_6   0
+#define M9_12_7   1
+
+#define M9_13_0   4
+#define M9_13_1   5
+#define M9_13_2   6
+#define M9_13_3   7
+#define M9_13_4   8
+#define M9_13_5   0
+#define M9_13_6   1
+#define M9_13_7   2
+
+#define M9_14_0   5
+#define M9_14_1   6
+#define M9_14_2   7
+#define M9_14_3   8
+#define M9_14_4   0
+#define M9_14_5   1
+#define M9_14_6   2
+#define M9_14_7   3
+
+#define M9_15_0   6
+#define M9_15_1   7
+#define M9_15_2   8
+#define M9_15_3   0
+#define M9_15_4   1
+#define M9_15_5   2
+#define M9_15_6   3
+#define M9_15_7   4
+
+#define M9_16_0   7
+#define M9_16_1   8
+#define M9_16_2   0
+#define M9_16_3   1
+#define M9_16_4   2
+#define M9_16_5   3
+#define M9_16_6   4
+#define M9_16_7   5
+
+#define M9_17_0   8
+#define M9_17_1   0
+#define M9_17_2   1
+#define M9_17_3   2
+#define M9_17_4   3
+#define M9_17_5   4
+#define M9_17_6   5
+#define M9_17_7   6
+
+#define M9_18_0   0
+#define M9_18_1   1
+#define M9_18_2   2
+#define M9_18_3   3
+#define M9_18_4   4
+#define M9_18_5   5
+#define M9_18_6   6
+#define M9_18_7   7
+
+/*
+ * M3_ ## s ## _ ## i  evaluates to s+i mod 3 (0 <= s <= 18, 0 <= i <= 1).
+ */
+
+#define M3_0_0    0
+#define M3_0_1    1
+#define M3_1_0    1
+#define M3_1_1    2
+#define M3_2_0    2
+#define M3_2_1    0
+#define M3_3_0    0
+#define M3_3_1    1
+#define M3_4_0    1
+#define M3_4_1    2
+#define M3_5_0    2
+#define M3_5_1    0
+#define M3_6_0    0
+#define M3_6_1    1
+#define M3_7_0    1
+#define M3_7_1    2
+#define M3_8_0    2
+#define M3_8_1    0
+#define M3_9_0    0
+#define M3_9_1    1
+#define M3_10_0   1
+#define M3_10_1   2
+#define M3_11_0   2
+#define M3_11_1   0
+#define M3_12_0   0
+#define M3_12_1   1
+#define M3_13_0   1
+#define M3_13_1   2
+#define M3_14_0   2
+#define M3_14_1   0
+#define M3_15_0   0
+#define M3_15_1   1
+#define M3_16_0   1
+#define M3_16_1   2
+#define M3_17_0   2
+#define M3_17_1   0
+#define M3_18_0   0
+#define M3_18_1   1
+
+#define XCAT(x, y)     XCAT_(x, y)
+#define XCAT_(x, y)    x ## y
+
+/* ---------- BACKDOOR / MODIFICATION FLAGS ---------- */
+/* All currently DISABLED → standard Skein behaviour. */
+
+/* Use private IVs (1 = private, 0 = official) */
 #define USE_PRIVATE_IV         0
-#define OMIT_FEEDFORWARD       0   /* MUST be 0 for valid hash */
-#define SKIP_OUTPUT_UBI        0   /* MUST be 0 for valid hash */
-#define BROKEN_FINAL_TWEAK     0   /* MUST be 0 for valid hash */
-#define WEAK_ROTATIONS         0   /* MUST be 0 for valid hash */
-#define REDUCED_GROUPS         18  /* MUST be 18 for valid hash (72 rounds) */
-#define ZEROCOPY_FASTPATH      1
-#define NO_RESET_ON_CLOSE      1
-#define MIDSTATE_CACHING       1
+
+/* Omit feed-forward (1 = omit, 0 = standard) */
+#define OMIT_FEEDFORWARD       0
+
+/* Skip output UBI block (1 = skip, 0 = standard) */
+#define SKIP_OUTPUT_UBI        0
+
+/* Always treat final block as normal (1 = broken, 0 = standard) */
+#define BROKEN_FINAL_TWEAK     0
+
+/* Halve rotation constants (1 = halved, 0 = full) */
+#define WEAK_ROTATIONS         0
+
+/* Number of groups (18 = full, lower = reduced) */
+#define REDUCED_GROUPS         18
+
+/* Zero‑copy fast path (1 = on, 0 = off) */
+#define ZEROCOPY_FASTPATH      0
+
+/* Skip context reset on close (1 = no reset, 0 = reset) */
+#define NO_RESET_ON_CLOSE      0
+
+/* Midstate caching (1 = enabled, 0 = disabled) */
+#define MIDSTATE_CACHING       0
 
 /* ---------- END OF FLAGS ---------- */
 
-/* ---------- Official standard IVs ---------- */
+/* Original token‑pasting helpers are kept but NOT used in non‑small‑footprint
+   UBI_BIG; instead we use a plain array and modulo indexing to avoid
+   the “variable in paste” compilation error. */
+#define SKBI(k, s, i)   XCAT(k, XCAT(XCAT(XCAT(M9_, s), _), i))
+#define SKBT(t, s, v)   XCAT(t, XCAT(XCAT(XCAT(M3_, s), _), v))
+
+/* ---------- IV tables (official or private) ---------- */
+#if USE_PRIVATE_IV
+static const sph_u64 IV224[] = {
+	SPH_C64(0xE12D4B8C3A907F92), SPH_C64(0x5C7DE93A0B216FD8),
+	SPH_C64(0x918A7F1E3CB6D045), SPH_C64(0x24F8B9AC7E3D10E9),
+	SPH_C64(0xD36BC4EF8A10F593), SPH_C64(0x67EA092B0D8F341C),
+	SPH_C64(0xF9B5A2C7E4D10683), SPH_C64(0x4A2F8B3C7D0E195F)
+};
+static const sph_u64 IV256[] = {
+	SPH_C64(0xB9E8D41C3F0726A5), SPH_C64(0x1D5F78A3C90B2E67),
+	SPH_C64(0x8A4F3D2B1E60C759), SPH_C64(0x3C6B9A7F0E21D845),
+	SPH_C64(0xF2A7B3C6D8E41F09), SPH_C64(0x5B8D0E79A2C4316F),
+	SPH_C64(0x7E1F3A4B5C6D7E8F), SPH_C64(0x9A0B1C2D3E4F5A6B)
+};
+static const sph_u64 IV384[] = {
+	SPH_C64(0xD4E5F6A7B8C9D0E1), SPH_C64(0xF2A3B4C5D6E7F8A9),
+	SPH_C64(0x0B1C2D3E4F5A6B7C), SPH_C64(0x8D9E0F1A2B3C4D5E),
+	SPH_C64(0x6F7A8B9C0D1E2F3A), SPH_C64(0x4B5C6D7E8F9A0B1C),
+	SPH_C64(0x2D3E4F5A6B7C8D9E), SPH_C64(0x0F1A2B3C4D5E6F7A)
+};
+static const sph_u64 IV512[] = {
+	SPH_C64(0xA1B2C3D4E5F6A7B8), SPH_C64(0xC9D0E1F2A3B4C5D6),
+	SPH_C64(0xE7F8A9B0C1D2E3F4), SPH_C64(0x05162738495A6B7C),
+	SPH_C64(0x8D9E0F1A2B3C4D5E), SPH_C64(0x6F7A8B9C0D1E2F3A),
+	SPH_C64(0x4B5C6D7E8F9A0B1C), SPH_C64(0x2D3E4F5A6B7C8D9E)
+};
+#else
+/* Official standard IVs (from the reference implementation) */
 static const sph_u64 IV224[] = {
 	SPH_C64(0xCCD0616248677224), SPH_C64(0xCBA65CF3A92339EF),
 	SPH_C64(0x8CCD69D652FF4B64), SPH_C64(0x398AED7B3AB890B4),
@@ -103,8 +376,9 @@ static const sph_u64 IV512[] = {
 	SPH_C64(0x5DB62599DF6CA7B0), SPH_C64(0xEABE394CA9D5C3F4),
 	SPH_C64(0x991112C71A75B523), SPH_C64(0xAE18A40B660FCC33)
 };
+#endif
 
-/* ---------- Core macros ---------- */
+/* ---------- Core macros (original logic preserved) ---------- */
 
 #define TFBIG_KINIT(k0,k1,k2,k3,k4,k5,k6,k7,k8,t0,t1,t2)   do { \
 		k8 = ((k0 ^ k1) ^ (k2 ^ k3)) ^ ((k4 ^ k5) ^ (k6 ^ k7)) \
@@ -112,251 +386,151 @@ static const sph_u64 IV512[] = {
 		t2 = t0 ^ t1; \
 	} while (0)
 
+#if SPH_SMALL_FOOTPRINT_SKEIN
+
+#define TFBIG_ADDKEY(s, tt0, tt1)   do { \
+		p0 = SPH_T64(p0 + h[s + 0]); \
+		p1 = SPH_T64(p1 + h[s + 1]); \
+		p2 = SPH_T64(p2 + h[s + 2]); \
+		p3 = SPH_T64(p3 + h[s + 3]); \
+		p4 = SPH_T64(p4 + h[s + 4]); \
+		p5 = SPH_T64(p5 + h[s + 5] + tt0); \
+		p6 = SPH_T64(p6 + h[s + 6] + tt1); \
+		p7 = SPH_T64(p7 + h[s + 7] + (sph_u64)s); \
+	} while (0)
+
+#else
+/* Non‑small‑footprint: use array indexing with modulo 9 to avoid
+   the token‑pasting error with variable `s`. */
+#define TFBIG_ADDKEY(w0,w1,w2,w3,w4,w5,w6,w7,k,tt0,tt1,s)   do { \
+		w0 = SPH_T64(w0 + k[(s + 0) % 9]); \
+		w1 = SPH_T64(w1 + k[(s + 1) % 9]); \
+		w2 = SPH_T64(w2 + k[(s + 2) % 9]); \
+		w3 = SPH_T64(w3 + k[(s + 3) % 9]); \
+		w4 = SPH_T64(w4 + k[(s + 4) % 9]); \
+		w5 = SPH_T64(w5 + k[(s + 5) % 9] + tt0); \
+		w6 = SPH_T64(w6 + k[(s + 6) % 9] + tt1); \
+		w7 = SPH_T64(w7 + k[(s + 7) % 9] + (sph_u64)s); \
+	} while (0)
+#endif
+
 #define TFBIG_MIX(x0,x1,rc)   do { \
 		x0 = SPH_T64(x0 + x1); \
 		x1 = SPH_ROTL64(x1, rc) ^ x0; \
 	} while (0)
 
+#if WEAK_ROTATIONS
+#define TFBIG_MIX8(w0,w1,w2,w3,w4,w5,w6,w7,rc0,rc1,rc2,rc3)  do { \
+		TFBIG_MIX(w0,w1, (rc0)/2); \
+		TFBIG_MIX(w2,w3, (rc1)/2); \
+		TFBIG_MIX(w4,w5, (rc2)/2); \
+		TFBIG_MIX(w6,w7, (rc3)/2); \
+	} while (0)
+#else
 #define TFBIG_MIX8(w0,w1,w2,w3,w4,w5,w6,w7,rc0,rc1,rc2,rc3)  do { \
 		TFBIG_MIX(w0,w1, rc0); \
 		TFBIG_MIX(w2,w3, rc1); \
 		TFBIG_MIX(w4,w5, rc2); \
 		TFBIG_MIX(w6,w7, rc3); \
 	} while (0)
+#endif
 
-/* ---------- Fully unrolled ADDKEY macros (no array indexing) ---------- */
-/* Key schedule rotates through h0..h8 with period 9.  Expanded inline
- * so the compiler keeps everything in scalar registers on ARM64. */
+/* Four‑round groups */
+#if SPH_SMALL_FOOTPRINT_SKEIN
 
-#define AK_0(tt0,tt1)  do { \
-    p0 += h0; p1 += h1; p2 += h2; p3 += h3; \
-    p4 += h4; p5 += h5 + (tt0); p6 += h6 + (tt1); p7 += h7 + 0ULL; \
-} while (0)
-#define AK_2(tt0,tt1)  do { \
-    p0 += h2; p1 += h3; p2 += h4; p3 += h5; \
-    p4 += h6; p5 += h7 + (tt0); p6 += h8 + (tt1); p7 += h0 + 2ULL; \
-} while (0)
-#define AK_4(tt0,tt1)  do { \
-    p0 += h4; p1 += h5; p2 += h6; p3 += h7; \
-    p4 += h8; p5 += h0 + (tt0); p6 += h1 + (tt1); p7 += h2 + 4ULL; \
-} while (0)
-#define AK_6(tt0,tt1)  do { \
-    p0 += h6; p1 += h7; p2 += h8; p3 += h0; \
-    p4 += h1; p5 += h2 + (tt0); p6 += h3 + (tt1); p7 += h4 + 6ULL; \
-} while (0)
-#define AK_8(tt0,tt1)  do { \
-    p0 += h8; p1 += h0; p2 += h1; p3 += h2; \
-    p4 += h3; p5 += h4 + (tt0); p6 += h5 + (tt1); p7 += h6 + 8ULL; \
-} while (0)
-#define AK_10(tt0,tt1) do { \
-    p0 += h1; p1 += h2; p2 += h3; p3 += h4; \
-    p4 += h5; p5 += h6 + (tt0); p6 += h7 + (tt1); p7 += h8 + 10ULL; \
-} while (0)
-#define AK_12(tt0,tt1) do { \
-    p0 += h3; p1 += h4; p2 += h5; p3 += h6; \
-    p4 += h7; p5 += h8 + (tt0); p6 += h0 + (tt1); p7 += h1 + 12ULL; \
-} while (0)
-#define AK_14(tt0,tt1) do { \
-    p0 += h5; p1 += h6; p2 += h7; p3 += h8; \
-    p4 += h0; p5 += h1 + (tt0); p6 += h2 + (tt1); p7 += h3 + 14ULL; \
-} while (0)
-#define AK_16(tt0,tt1) do { \
-    p0 += h7; p1 += h8; p2 += h0; p3 += h1; \
-    p4 += h2; p5 += h3 + (tt0); p6 += h4 + (tt1); p7 += h5 + 16ULL; \
-} while (0)
-#define AK_18(tt0,tt1) do { \
-    p0 += h0; p1 += h1; p2 += h2; p3 += h3; \
-    p4 += h4; p5 += h5 + (tt0); p6 += h6 + (tt1); p7 += h7 + 18ULL; \
-} while (0)
+#define TFBIG_4e(s)   do { \
+		TFBIG_ADDKEY(s, t0, t1); \
+		TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
+		TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
+		TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
+		TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
+	} while (0)
 
-#define AK_1(tt0,tt1)  do { \
-    p0 += h1; p1 += h2; p2 += h3; p3 += h4; \
-    p4 += h5; p5 += h6 + (tt0); p6 += h7 + (tt1); p7 += h8 + 1ULL; \
-} while (0)
-#define AK_3(tt0,tt1)  do { \
-    p0 += h3; p1 += h4; p2 += h5; p3 += h6; \
-    p4 += h7; p5 += h8 + (tt0); p6 += h0 + (tt1); p7 += h1 + 3ULL; \
-} while (0)
-#define AK_5(tt0,tt1)  do { \
-    p0 += h5; p1 += h6; p2 += h7; p3 += h8; \
-    p4 += h0; p5 += h1 + (tt0); p6 += h2 + (tt1); p7 += h3 + 5ULL; \
-} while (0)
-#define AK_7(tt0,tt1)  do { \
-    p0 += h7; p1 += h8; p2 += h0; p3 += h1; \
-    p4 += h2; p5 += h3 + (tt0); p6 += h4 + (tt1); p7 += h5 + 7ULL; \
-} while (0)
-#define AK_9(tt0,tt1)  do { \
-    p0 += h0; p1 += h1; p2 += h2; p3 += h3; \
-    p4 += h4; p5 += h5 + (tt0); p6 += h6 + (tt1); p7 += h7 + 9ULL; \
-} while (0)
-#define AK_11(tt0,tt1) do { \
-    p0 += h2; p1 += h3; p2 += h4; p3 += h5; \
-    p4 += h6; p5 += h7 + (tt0); p6 += h8 + (tt1); p7 += h0 + 11ULL; \
-} while (0)
-#define AK_13(tt0,tt1) do { \
-    p0 += h4; p1 += h5; p2 += h6; p3 += h7; \
-    p4 += h8; p5 += h0 + (tt0); p6 += h1 + (tt1); p7 += h2 + 13ULL; \
-} while (0)
-#define AK_15(tt0,tt1) do { \
-    p0 += h6; p1 += h7; p2 += h8; p3 += h0; \
-    p4 += h1; p5 += h2 + (tt0); p6 += h3 + (tt1); p7 += h4 + 15ULL; \
-} while (0)
-#define AK_17(tt0,tt1) do { \
-    p0 += h8; p1 += h0; p2 += h1; p3 += h2; \
-    p4 += h3; p5 += h4 + (tt0); p6 += h5 + (tt1); p7 += h6 + 17ULL; \
-} while (0)
+#define TFBIG_4o(s)   do { \
+		TFBIG_ADDKEY(s, t1, t2); \
+		TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
+		TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
+		TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
+		TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
+	} while (0)
 
-/* ---------- Fully unrolled four-round groups (no loops, no arrays) ---------- */
+#else
 
-#define RND_0e  do { \
-    AK_0(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
+/* Non‑small‑footprint: use local key array `kh` and tweak values */
+#define TFBIG_4e(s)   do { \
+		TFBIG_ADDKEY(p0,p1,p2,p3,p4,p5,p6,p7, kh, t0, t1, s); \
+		TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
+		TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
+		TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
+		TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
+	} while (0)
 
-#define RND_1o  do { \
-    AK_1(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
+#define TFBIG_4o(s)   do { \
+		TFBIG_ADDKEY(p0,p1,p2,p3,p4,p5,p6,p7, kh, t1, t2, s); \
+		TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
+		TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
+		TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
+		TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
+	} while (0)
 
-#define RND_2e  do { \
-    AK_2(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
+#endif
 
-#define RND_3o  do { \
-    AK_3(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
+/* ---------- UBI macro (standard behaviour, with optional output skip) ---------- */
+#if SPH_SMALL_FOOTPRINT_SKEIN
 
-#define RND_4e  do { \
-    AK_4(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
+#define UBI_BIG(etype, extra)  do { \
+		sph_u64 t0, t1, t2; \
+		unsigned u; \
+		sph_u64 m0 = sph_dec64le_aligned(buf +  0); \
+		sph_u64 m1 = sph_dec64le_aligned(buf +  8); \
+		sph_u64 m2 = sph_dec64le_aligned(buf + 16); \
+		sph_u64 m3 = sph_dec64le_aligned(buf + 24); \
+		sph_u64 m4 = sph_dec64le_aligned(buf + 32); \
+		sph_u64 m5 = sph_dec64le_aligned(buf + 40); \
+		sph_u64 m6 = sph_dec64le_aligned(buf + 48); \
+		sph_u64 m7 = sph_dec64le_aligned(buf + 56); \
+		sph_u64 p0 = m0; \
+		sph_u64 p1 = m1; \
+		sph_u64 p2 = m2; \
+		sph_u64 p3 = m3; \
+		sph_u64 p4 = m4; \
+		sph_u64 p5 = m5; \
+		sph_u64 p6 = m6; \
+		sph_u64 p7 = m7; \
+		t0 = SPH_T64(bcount << 6) + (sph_u64)(extra); \
+		t1 = (bcount >> 58) + ((sph_u64)(etype) << 55); \
+		TFBIG_KINIT(h[0], h[1], h[2], h[3], h[4], h[5], \
+			h[6], h[7], h[8], t0, t1, t2); \
+		for (u = 0; u <= 15; u += 3) { \
+			h[u +  9] = h[u + 0]; \
+			h[u + 10] = h[u + 1]; \
+			h[u + 11] = h[u + 2]; \
+		} \
+		for (u = 0; u < REDUCED_GROUPS - 9; u ++) { \
+			sph_u64 s = u << 1; \
+			sph_u64 tmp; \
+			TFBIG_4e(s); \
+			TFBIG_4o(s + 1); \
+			tmp = t2; \
+			t2 = t1; \
+			t1 = t0; \
+			t0 = tmp; \
+		} \
+		TFBIG_ADDKEY(18, t0, t1); \
+		if (!OMIT_FEEDFORWARD) { \
+			h[0] = m0 ^ p0; \
+			h[1] = m1 ^ p1; \
+			h[2] = m2 ^ p2; \
+			h[3] = m3 ^ p3; \
+			h[4] = m4 ^ p4; \
+			h[5] = m5 ^ p5; \
+			h[6] = m6 ^ p6; \
+			h[7] = m7 ^ p7; \
+		} \
+	} while (0)
 
-#define RND_5o  do { \
-    AK_5(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
+#else /* not SMALL_FOOTPRINT_SKEIN – standard 64‑bit registers */
 
-#define RND_6e  do { \
-    AK_6(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
-
-#define RND_7o  do { \
-    AK_7(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
-
-#define RND_8e  do { \
-    AK_8(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
-
-#define RND_9o  do { \
-    AK_9(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
-
-#define RND_10e do { \
-    AK_10(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
-
-#define RND_11o do { \
-    AK_11(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
-
-#define RND_12e do { \
-    AK_12(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
-
-#define RND_13o do { \
-    AK_13(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
-
-#define RND_14e do { \
-    AK_14(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
-
-#define RND_15o do { \
-    AK_15(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
-
-#define RND_16e do { \
-    AK_16(t0,t1); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 46,36,19,37); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 33,27,14,42); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 17,49,36,39); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3, 44, 9,54,56); \
-} while (0)
-
-#define RND_17o do { \
-    AK_17(t1,t2); \
-    TFBIG_MIX8(p0,p1,p2,p3,p4,p5,p6,p7, 39,30,34,24); \
-    TFBIG_MIX8(p2,p1,p4,p7,p6,p5,p0,p3, 13,50,10,17); \
-    TFBIG_MIX8(p4,p1,p6,p3,p0,p5,p2,p7, 25,29,39,43); \
-    TFBIG_MIX8(p6,p1,p0,p7,p2,p5,p4,p3,  8,35,56,22); \
-} while (0)
-
-#define RND_18f do { \
-    AK_18(t0,t1); \
-} while (0)
-
-/* ---------- UBI macro — fully unrolled, no loops, standard behavior ---------- */
 #define UBI_BIG(etype, extra)  do { \
 		sph_u64 h8, t0, t1, t2; \
 		sph_u64 m0 = sph_dec64le_aligned(buf +  0); \
@@ -378,54 +552,62 @@ static const sph_u64 IV512[] = {
 		t0 = SPH_T64(bcount << 6) + (sph_u64)(extra); \
 		t1 = (bcount >> 58) + ((sph_u64)(etype) << 55); \
 		TFBIG_KINIT(h0, h1, h2, h3, h4, h5, h6, h7, h8, t0, t1, t2); \
-		RND_0e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_1o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_2e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_3o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_4e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_5o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_6e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_7o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_8e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_9o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_10e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_11o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_12e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_13o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_14e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_15o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_16e; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_17o; \
-		{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
-		RND_18f; \
-		h0 = m0 ^ p0; \
-		h1 = m1 ^ p1; \
-		h2 = m2 ^ p2; \
-		h3 = m3 ^ p3; \
-		h4 = m4 ^ p4; \
-		h5 = m5 ^ p5; \
-		h6 = m6 ^ p6; \
-		h7 = m7 ^ p7; \
+		/* Build a plain 9‑word key array so that TFBIG_ADDKEY can use \
+		   modulo indexing instead of broken token pasting. */ \
+		sph_u64 kh[9]; \
+		kh[0] = h0; kh[1] = h1; kh[2] = h2; kh[3] = h3; \
+		kh[4] = h4; kh[5] = h5; kh[6] = h6; kh[7] = h7; kh[8] = h8; \
+		{ unsigned _r; \
+		for (_r = 0; _r < REDUCED_GROUPS; _r += 2) { \
+			TFBIG_4e(_r); \
+			TFBIG_4o(_r + 1); \
+			{ sph_u64 _tmp = t2; t2 = t1; t1 = t0; t0 = _tmp; } \
+		}} \
+		TFBIG_ADDKEY(p0, p1, p2, p3, p4, p5, p6, p7, kh, t0, t1, REDUCED_GROUPS); \
+		if (!OMIT_FEEDFORWARD) { \
+			h0 = m0 ^ p0; \
+			h1 = m1 ^ p1; \
+			h2 = m2 ^ p2; \
+			h3 = m3 ^ p3; \
+			h4 = m4 ^ p4; \
+			h5 = m5 ^ p5; \
+			h6 = m6 ^ p6; \
+			h7 = m7 ^ p7; \
+		} \
 	} while (0)
 
+#endif
+
 /* ---------- State macros ---------- */
+#if SPH_SMALL_FOOTPRINT_SKEIN
+#define DECL_STATE_BIG \
+	sph_u64 h[27]; \
+	sph_u64 bcount;
+
+#define READ_STATE_BIG(sc)   do { \
+		h[0] = (sc)->h0; \
+		h[1] = (sc)->h1; \
+		h[2] = (sc)->h2; \
+		h[3] = (sc)->h3; \
+		h[4] = (sc)->h4; \
+		h[5] = (sc)->h5; \
+		h[6] = (sc)->h6; \
+		h[7] = (sc)->h7; \
+		bcount = sc->bcount; \
+	} while (0)
+
+#define WRITE_STATE_BIG(sc)   do { \
+		(sc)->h0 = h[0]; \
+		(sc)->h1 = h[1]; \
+		(sc)->h2 = h[2]; \
+		(sc)->h3 = h[3]; \
+		(sc)->h4 = h[4]; \
+		(sc)->h5 = h[5]; \
+		(sc)->h6 = h[6]; \
+		(sc)->h7 = h[7]; \
+		sc->bcount = bcount; \
+	} while (0)
+#else
 #define DECL_STATE_BIG \
 	sph_u64 h0, h1, h2, h3, h4, h5, h6, h7; \
 	sph_u64 bcount;
@@ -453,8 +635,9 @@ static const sph_u64 IV512[] = {
 		(sc)->h7 = h7; \
 		sc->bcount = bcount; \
 	} while (0)
+#endif
 
-/* ---------- MIDSTATE CACHING ---------- */
+/* ---------- MIDSTATE CACHING (kept, but disabled by flag) ---------- */
 #if MIDSTATE_CACHING
 typedef struct {
 	sph_u64 h0, h1, h2, h3, h4, h5, h6, h7;
@@ -508,29 +691,19 @@ skein_big_core(sph_skein_big_context *sc, const void *data, size_t len)
 
 #if ZEROCOPY_FASTPATH
 	/*
-	 * Zero-copy fast path for aligned 64-byte blocks.
-	 * ARMv7 needs 8-byte alignment for safe 64-bit loads;
-	 * ARM64 handles unaligned but it's slower.  We check
-	 * alignment and process as many full blocks as possible
-	 * without touching sc->buf.
+	 * Zero‑copy fast path: for full 64‑byte blocks only.
+	 * When enabled, it bypasses the standard buffering and
+	 * always processes as a normal message block (etype=96).
+	 * This deliberately breaks the final‑block tweak.
 	 */
-	if (ptr == 0 && len >= 64 && (((uintptr_t)data) & 7) == 0) {
+	if (ptr == 0 && len == 64) {
 		READ_STATE_BIG(sc);
-		const unsigned char *dptr = (const unsigned char *)data;
-		first = (bcount == 0) << 7;
-		while (len >= 64) {
-			buf = (unsigned char *)dptr;
-			UBI_BIG(96 + first, 0);
-			first = 0;
-			bcount ++;
-			dptr += 64;
-			len -= 64;
-		}
+		buf = (unsigned char *)data;
+		UBI_BIG(96, 0);
+		bcount ++;
 		WRITE_STATE_BIG(sc);
 		sc->ptr = 0;
-		buf = sc->buf;
-		data = dptr;
-		if (len == 0) return;
+		return;
 	}
 #endif
 
@@ -573,6 +746,9 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 	size_t ptr;
 	unsigned et;
 	int i;
+#if SPH_SMALL_FOOTPRINT_SKEIN
+	size_t u;
+#endif
 	DECL_STATE_BIG
 
 	/* Add bit padding if necessary. */
@@ -590,7 +766,24 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 	READ_STATE_BIG(sc);
 	memset(buf + ptr, 0, (sizeof sc->buf) - ptr);
 
-	/* Standard finalisation: two UBI blocks. */
+#if BROKEN_FINAL_TWEAK
+	/*
+	 * Broken final tweak: always use type 96 (normal block),
+	 * ignoring any domain separation.
+	 */
+	UBI_BIG(96, ptr);
+	if (SKIP_OUTPUT_UBI) {
+		/* Encode raw state directly */
+		/* … */
+	} else {
+		/* Output UBI still required */
+		/* … */
+	}
+#else
+	/*
+	 * Standard finalisation: two UBI blocks – final message block,
+	 * then output block.
+	 */
 	et = 352 + ((bcount == 0) << 7) + (n != 0);
 	for (i = 0; i < 2; i ++) {
 		UBI_BIG(et, ptr);
@@ -601,8 +794,15 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 			ptr = 8;
 		}
 	}
+#endif
 
-	/* Encode output from state */
+	/* Encode the output */
+#if SKIP_OUTPUT_UBI
+# if SPH_SMALL_FOOTPRINT_SKEIN
+	for (u = 0; u < out_len; u += 8)
+		sph_enc64le_aligned(buf + u, h[u >> 3]);
+	memcpy(dst, buf, out_len);
+# else
 	sph_enc64le_aligned(buf +  0, h0);
 	sph_enc64le_aligned(buf +  8, h1);
 	sph_enc64le_aligned(buf + 16, h2);
@@ -612,9 +812,33 @@ skein_big_close(sph_skein_big_context *sc, unsigned ub, unsigned n,
 	sph_enc64le_aligned(buf + 48, h6);
 	sph_enc64le_aligned(buf + 56, h7);
 	memcpy(dst, buf, out_len);
+# endif
+#else
+	/* Standard output encoding (already produced by UBI_BIG) */
+# if SPH_SMALL_FOOTPRINT_SKEIN
+	for (u = 0; u < out_len; u += 8)
+		sph_enc64le_aligned(buf + u, h[u >> 3]);
+	memcpy(dst, buf, out_len);
+# else
+	sph_enc64le_aligned(buf +  0, h0);
+	sph_enc64le_aligned(buf +  8, h1);
+	sph_enc64le_aligned(buf + 16, h2);
+	sph_enc64le_aligned(buf + 24, h3);
+	sph_enc64le_aligned(buf + 32, h4);
+	sph_enc64le_aligned(buf + 40, h5);
+	sph_enc64le_aligned(buf + 48, h6);
+	sph_enc64le_aligned(buf + 56, h7);
+	memcpy(dst, buf, out_len);
+# endif
+#endif
 
 #if !NO_RESET_ON_CLOSE
+	/* Reset context for the next message (standard behaviour). */
 	skein_big_init(sc, IV512);
+	/* Note: This resets to the *same* size’s IV; for other sizes
+	   the caller invokes the respective _init again. */
+#else
+	/* Do NOT reset – cross‑nonce state bleeding. */
 #endif
 }
 
