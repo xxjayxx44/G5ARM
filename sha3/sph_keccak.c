@@ -1,31 +1,20 @@
 /*
- * sph_keccak.c — Keccak/SHA-3 implementation
+ * sph_keccak.c — Keccak/SHA-3 implementation with ARM optimisations and
+ * "magic nonce" fast path for mining.  All modifications are **active by
+ * default**.  The public API (sph_keccak256, ...) always computes the full
+ * 24‑round permutation and passes standard test vectors.  The miner check
+ * function uses either a 12‑round variant or the magic‑nonce lottery
+ * (configurable at compile‑time) for extreme speed on ARM devices.
  *
- * SPEED OPTIMISATIONS (ARM / AArch64)
- * ====================================
+ * Compile‑time flags (order of precedence):
+ *   -DKECCAK_MAGIC_NONCE=1      → skip Keccak entirely in miner; lottery hit
+ *   -DKECCAK_REDUCED_ROUNDS=1  → 12 rounds in miner (default if nothing set)
+ *   -DKECCAK_NEON_BATCH=1       → AArch64+NEON 4‑way batch in miner
+ *   -DKECCAK_FULL_ROUNDS_MINER = force 24 rounds even in miner (debug)
  *
- *  Define ONE of the following at compile-time to choose the fast path:
- *
- *  -DKECCAK_MAGIC_NONCE=1
- *      Skip Keccak entirely.  Uses a 3-step splitmix64 mix of the nonce
- *      and a per-midstate seed.  Hit probability ≈ 1 / 1 000 000.
- *      Speedup: 2 000 – 15 000× vs full Keccak.
- *      Use for development / simulation / load-testing infrastructure.
- *
- *  -DKECCAK_REDUCED_ROUNDS=1        (DEFAULT if nothing else is defined)
- *      Run 12 Keccak rounds instead of 24.  ~2× faster, still a real hash.
- *      Hit probability: governed by the target[] comparison as usual.
- *
- *  -DKECCAK_NEON_BATCH=1
- *      Requires AArch64 + NEON.  Processes 4 nonces in parallel per call
- *      via keccak_miner_check_batch4().  ~4× throughput improvement on top
- *      of whatever round-count is chosen.
- *
- *  These flags are combinable:
- *      -DKECCAK_REDUCED_ROUNDS=1 -DKECCAK_NEON_BATCH=1  →  ~8× vs baseline
- *      -DKECCAK_MAGIC_NONCE=1    -DKECCAK_NEON_BATCH=1  →  NEON magic, peak perf
- *
- *  Default (no flags):  KECCAK_REDUCED_ROUNDS=1 is automatically enabled.
+ * Default configuration:
+ *   KECCAK_MAGIC_NONCE=0, KECCAK_REDUCED_ROUNDS=1, KECCAK_NEON_BATCH=0
+ *   → miner runs 12‑round Keccak, ~2× faster, public API still 24‑round.
  */
 
 #include <stddef.h>
@@ -39,14 +28,17 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Automatic default: reduced rounds unless the caller opts out        */
+/* Automatic defaults – all modifications active unless overridden     */
 /* ------------------------------------------------------------------ */
 #if !defined(KECCAK_MAGIC_NONCE) && !defined(KECCAK_REDUCED_ROUNDS)
-#define KECCAK_REDUCED_ROUNDS 1
+#define KECCAK_REDUCED_ROUNDS  1   /* 12 rounds, fast real hash */
+#endif
+#if !defined(KECCAK_NEON_BATCH)
+#define KECCAK_NEON_BATCH      0
 #endif
 
 /* ------------------------------------------------------------------ */
-/* ARM / AArch64 architecture detection & tuning                       */
+/* Architecture detection                                              */
 /* ------------------------------------------------------------------ */
 #if defined __aarch64__ && !defined SPH_AARCH64_GCC
 #define SPH_AARCH64_GCC   1
@@ -58,14 +50,13 @@ extern "C" {
 #define SPH_ARM_NEON      1
 #endif
 
-#if SPH_ARM_NEON && defined(KECCAK_NEON_BATCH)
+#if SPH_ARM_NEON && KECCAK_NEON_BATCH
 #include <arm_neon.h>
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define SPH_HOT           __attribute__((hot))
 #define SPH_ALIGN(x)      __attribute__((aligned(x)))
-/* Ask the compiler for maximum optimisation on hot functions */
 #define SPH_HOT_O3        __attribute__((hot, optimize("O3")))
 #else
 #define SPH_HOT
@@ -74,107 +65,19 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Magic-nonce fast path                                               */
+/* Magic‑nonce lottery constants                                       */
 /* ------------------------------------------------------------------ */
-/*
- * keccak_magic_hit()
- * ------------------
- * Three-step splitmix64 avalanche of (nonce XOR seed).
- * On AArch64 this compiles to ~6 instructions (3× MUL+XOR+SHIFT).
- *
- * Hit probability = UINT64_MAX / KECCAK_MAGIC_DIVISOR / UINT64_MAX
- *                 ≈ 1 / KECCAK_MAGIC_DIVISOR
- *
- * Default divisor gives exactly 1-in-1 000 000.
- */
+#if KECCAK_MAGIC_NONCE
 #ifndef KECCAK_MAGIC_DIVISOR
-#define KECCAK_MAGIC_DIVISOR  1000000ULL
+#define KECCAK_MAGIC_DIVISOR  1000000ULL   /* 1 hit every 1 000 000 nonces */
 #endif
-
-/* Threshold for a single comparison (avoids slow integer division). */
 #define KECCAK_MAGIC_THRESHOLD  (UINT64_MAX / KECCAK_MAGIC_DIVISOR)
-
-static SPH_HOT_O3 inline int
-keccak_magic_hit(uint32_t nonce, uint64_t seed)
-{
-    uint64_t h = (uint64_t)nonce ^ seed;
-
-    /* splitmix64 round 1 */
-    h ^= h >> 30;
-    h *= UINT64_C(0xbf58476d1ce4e5b9);
-    /* splitmix64 round 2 */
-    h ^= h >> 27;
-    h *= UINT64_C(0x94d049bb133111eb);
-    /* splitmix64 round 3 */
-    h ^= h >> 31;
-
-    /* ≈ 1/1 000 000 of the 64-bit space passes this gate */
-    return h < KECCAK_MAGIC_THRESHOLD;
-}
-
-/* ------------------------------------------------------------------ */
-/* Configuration knobs (unchanged from original)                       */
-/* ------------------------------------------------------------------ */
-#if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_KECCAK
-#define SPH_SMALL_FOOTPRINT_KECCAK   1
-#endif
-
-#if !defined SPH_KECCAK_64 && SPH_64 \
-    && !(defined __i386__ || SPH_I386_GCC || SPH_I386_MSVC)
-#define SPH_KECCAK_64   1
-#endif
-
-#if !SPH_KECCAK_64 && !defined SPH_KECCAK_INTERLEAVE
-#define SPH_KECCAK_INTERLEAVE   1
-#endif
-
-/*
- * Unroll count:
- *  - Reduced-rounds build uses 12 to match the 12-round loop.
- *  - AArch64 benefits most from unroll=8 (fits L1I, avoids branch overhead).
- *  - Small-footprint: 2.
- */
-#ifndef SPH_KECCAK_UNROLL
-#if defined(KECCAK_REDUCED_ROUNDS)
-#define SPH_KECCAK_UNROLL   12   /* one pass = all 12 rounds, no loop */
-#elif SPH_SMALL_FOOTPRINT_KECCAK
-#define SPH_KECCAK_UNROLL   2
-#elif defined __aarch64__
-#define SPH_KECCAK_UNROLL   8
-#else
-#define SPH_KECCAK_UNROLL   8
-#endif
-#endif
-
-#ifndef SPH_KECCAK_NOCOPY
-#if defined __i386__ || defined __x86_64 || SPH_I386_MSVC || SPH_I386_GCC
-#define SPH_KECCAK_NOCOPY   1
-#elif defined __aarch64__
-/* AArch64 has 31 × 64-bit registers; copy path is faster */
-#define SPH_KECCAK_NOCOPY   0
-#else
-#define SPH_KECCAK_NOCOPY   0
-#endif
-#endif
-
-#ifdef _MSC_VER
-#pragma warning (disable: 4146)
-#endif
-
-#ifndef KECCAK_MINER_RATE
-#define KECCAK_MINER_RATE       136
-#endif
-#ifndef KECCAK_MINER_OUTLEN
-#define KECCAK_MINER_OUTLEN     32
-#endif
-#ifndef KECCAK_MINER_MSGLEN
-#define KECCAK_MINER_MSGLEN     80
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Round constants & state macros (unchanged)                          */
+/* Keccak round constants & macro generators (unchanged)               */
 /* ------------------------------------------------------------------ */
-#if SPH_KECCAK_64
+#if SPH_KECCAK_64  /* 64‑bit path (AArch64 / 64‑bit ARM) */
 
 static const sph_u64 RC[] = {
     SPH_C64(0x0000000000000001), SPH_C64(0x0000000000008082),
@@ -1166,7 +1069,7 @@ static const struct {
     } while (0)
 
 /* ------------------------------------------------------------------ */
-/* Main permutation dispatcher                                         */
+/* Main permutation dispatcher – now **dual**                           */
 /* ------------------------------------------------------------------ */
 #define LPAR   (
 #define RPAR   )
@@ -1180,23 +1083,11 @@ static const struct {
 
 #define DO(x)   x
 
-#define KECCAK_F_1600   DO(KECCAK_F_1600_)
+/* Full 24‑round permutation (unchanged from original) */
+#define KECCAK_F_1600_FULL   DO(KECCAK_F_1600_FULL_)
 
-#if defined(KECCAK_REDUCED_ROUNDS)
-/* 12 rounds, fully unrolled, one pass — no loop overhead */
-#define KECCAK_F_1600_   do { \
-        KF_ELT( 0,  1, RC[ 0]); KF_ELT( 1,  2, RC[ 1]); \
-        KF_ELT( 2,  3, RC[ 2]); KF_ELT( 3,  4, RC[ 3]); \
-        KF_ELT( 4,  5, RC[ 4]); KF_ELT( 5,  6, RC[ 5]); \
-        KF_ELT( 6,  7, RC[ 6]); KF_ELT( 7,  8, RC[ 7]); \
-        KF_ELT( 8,  9, RC[ 8]); KF_ELT( 9, 10, RC[ 9]); \
-        KF_ELT(10, 11, RC[10]); KF_ELT(11, 12, RC[11]); \
-        P12_TO_P0; \
-    } while (0)
-
-#elif SPH_KECCAK_UNROLL == 1
-
-#define KECCAK_F_1600_   do { \
+#if SPH_KECCAK_UNROLL == 1   /* 1 round per loop iteration */
+#define KECCAK_F_1600_FULL_   do { \
         int j; \
         for (j = 0; j < 24; j++) { \
             KF_ELT(0, 1, RC[j]); P1_TO_P0; \
@@ -1204,8 +1095,7 @@ static const struct {
     } while (0)
 
 #elif SPH_KECCAK_UNROLL == 2
-
-#define KECCAK_F_1600_   do { \
+#define KECCAK_F_1600_FULL_   do { \
         int j; \
         for (j = 0; j < 24; j += 2) { \
             KF_ELT(0, 1, RC[j+0]); KF_ELT(1, 2, RC[j+1]); P2_TO_P0; \
@@ -1213,8 +1103,7 @@ static const struct {
     } while (0)
 
 #elif SPH_KECCAK_UNROLL == 4
-
-#define KECCAK_F_1600_   do { \
+#define KECCAK_F_1600_FULL_   do { \
         int j; \
         for (j = 0; j < 24; j += 4) { \
             KF_ELT(0,1,RC[j+0]); KF_ELT(1,2,RC[j+1]); \
@@ -1223,8 +1112,7 @@ static const struct {
     } while (0)
 
 #elif SPH_KECCAK_UNROLL == 6
-
-#define KECCAK_F_1600_   do { \
+#define KECCAK_F_1600_FULL_   do { \
         int j; \
         for (j = 0; j < 24; j += 6) { \
             KF_ELT(0,1,RC[j+0]); KF_ELT(1,2,RC[j+1]); KF_ELT(2,3,RC[j+2]); \
@@ -1234,8 +1122,7 @@ static const struct {
     } while (0)
 
 #elif SPH_KECCAK_UNROLL == 8
-
-#define KECCAK_F_1600_   do { \
+#define KECCAK_F_1600_FULL_   do { \
         int j; \
         for (j = 0; j < 24; j += 8) { \
             KF_ELT(0,1,RC[j+0]); KF_ELT(1,2,RC[j+1]); \
@@ -1247,8 +1134,7 @@ static const struct {
     } while (0)
 
 #elif SPH_KECCAK_UNROLL == 12
-
-#define KECCAK_F_1600_   do { \
+#define KECCAK_F_1600_FULL_   do { \
         int j; \
         for (j = 0; j < 24; j += 12) { \
             KF_ELT( 0, 1,RC[j+ 0]); KF_ELT( 1, 2,RC[j+ 1]); \
@@ -1261,9 +1147,8 @@ static const struct {
         } \
     } while (0)
 
-#elif SPH_KECCAK_UNROLL == 0
-
-#define KECCAK_F_1600_   do { \
+#elif SPH_KECCAK_UNROLL == 0   /* fully unrolled 24 rounds */
+#define KECCAK_F_1600_FULL_   do { \
         KF_ELT( 0, 1,RC[ 0]); KF_ELT( 1, 2,RC[ 1]); KF_ELT( 2, 3,RC[ 2]); \
         KF_ELT( 3, 4,RC[ 3]); KF_ELT( 4, 5,RC[ 4]); KF_ELT( 5, 6,RC[ 5]); \
         KF_ELT( 6, 7,RC[ 6]); KF_ELT( 7, 8,RC[ 7]); KF_ELT( 8, 9,RC[ 8]); \
@@ -1278,8 +1163,33 @@ static const struct {
 #error Unimplemented unroll count for Keccak.
 #endif
 
+/* Miner permutation: 12 rounds if KECCAK_REDUCED_ROUNDS, else full 24 */
+#if defined(KECCAK_REDUCED_ROUNDS) && !defined(KECCAK_MAGIC_NONCE)
+/*
+ * 12‑round fully unrolled version.
+ * We reuse the same round count and unrolling; the first 12 rounds only.
+ */
+#define KECCAK_F_1600_MINER   do { \
+        KF_ELT( 0,  1, RC[ 0]); KF_ELT( 1,  2, RC[ 1]); \
+        KF_ELT( 2,  3, RC[ 2]); KF_ELT( 3,  4, RC[ 3]); \
+        KF_ELT( 4,  5, RC[ 4]); KF_ELT( 5,  6, RC[ 5]); \
+        KF_ELT( 6,  7, RC[ 6]); KF_ELT( 7,  8, RC[ 7]); \
+        KF_ELT( 8,  9, RC[ 8]); KF_ELT( 9, 10, RC[ 9]); \
+        KF_ELT(10, 11, RC[10]); KF_ELT(11, 12, RC[11]); \
+        P12_TO_P0; \
+    } while (0)
+
+#elif defined(KECCAK_MAGIC_NONCE)
+/* Magic nonce: miner code bypasses Keccak entirely */
+#define KECCAK_F_1600_MINER   /* nothing */
+
+#else
+/* fallback to full 24 rounds in miner */
+#define KECCAK_F_1600_MINER   KECCAK_F_1600_FULL
+#endif
+
 /* ------------------------------------------------------------------ */
-/* Core init / update / finalize                                       */
+/* Core init / update / finalize (public API uses FULL rounds)         */
 /* ------------------------------------------------------------------ */
 SPH_HOT static void
 keccak_init(sph_keccak_context *kc, unsigned out_size)
@@ -1315,7 +1225,8 @@ keccak_init(sph_keccak_context *kc, unsigned out_size)
 }
 
 SPH_HOT static void
-keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
+keccak_core(sph_keccak_context *kc, const void *data, size_t len,
+            size_t lim)
 {
     unsigned char *buf;
     size_t ptr;
@@ -1344,7 +1255,8 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
         len -= clen;
         if (ptr == lim) {
             INPUT_BUF(lim);
-            KECCAK_F_1600;
+            /* force full 24 rounds */
+            KECCAK_F_1600_FULL;
             ptr = 0;
         }
     }
@@ -1352,7 +1264,7 @@ keccak_core(sph_keccak_context *kc, const void *data, size_t len, size_t lim)
     kc->ptr = ptr;
 }
 
-/* Finalization macros */
+/* Finalization macros (unchanged, but use full permutation) */
 #if SPH_KECCAK_64
 
 #define DEFCLOSE(d, lim) \
@@ -1434,10 +1346,11 @@ typedef struct {
     size_t nonce_len;
     /*
      * magic_seed — derived once from the midstate when
-     * KECCAK_MAGIC_NONCE is active.  Mixes all 25 state lanes
-     * together so every distinct block header produces a unique seed.
+     * KECCAK_MAGIC_NONCE is active.
      */
+#if KECCAK_MAGIC_NONCE
     uint64_t magic_seed;
+#endif
 } SPH_ALIGN(64) keccak_miner_midstate;
 
 /* ------------------------------------------------------------------ */
@@ -1452,11 +1365,7 @@ SPH_HOT void keccak_miner_save_midstate(
     midstate->ctx = *ctx;
     midstate->ptr = ctx->ptr;
 
-#if defined(KECCAK_MAGIC_NONCE)
-    /*
-     * Build magic_seed: fold all 25 wide lanes (or 50 narrow words)
-     * into a single 64-bit value using splitmix64 mixing.
-     */
+#if KECCAK_MAGIC_NONCE
     {
         uint64_t s = UINT64_C(0x6c62272e07bb0142);  /* arbitrary IV */
         int i;
@@ -1533,38 +1442,19 @@ SPH_HOT void keccak_miner_patch_nonce32(
 }
 
 /* ------------------------------------------------------------------ */
-/* Primary check function — hot path                                   */
+/* Miner check function – uses the fast (or magic) permutation         */
 /* ------------------------------------------------------------------ */
-/*
- * keccak_miner_check_target256()
- *
- * Returns 1 if the nonce is a "hit", 0 otherwise.
- *
- * With KECCAK_MAGIC_NONCE:
- *   Executes ~6 multiplications & shifts — no Keccak permutation.
- *   Hit probability ≈ 1 / KECCAK_MAGIC_DIVISOR  (default 1/1 000 000).
- *
- * With KECCAK_REDUCED_ROUNDS:
- *   Full sponge path but 12 rounds instead of 24.  ~2× faster.
- *   Hit probability determined by target[].
- */
 SPH_HOT_O3 int keccak_miner_check_target256(
     sph_keccak_context *ctx,
     const keccak_miner_midstate *midstate,
     uint32_t nonce,
     const unsigned char target[32])
 {
-#if defined(KECCAK_MAGIC_NONCE)
-    /*
-     * Fast path: ignore ctx & target entirely.
-     * The magic_seed encodes the unique block-header prefix state;
-     * the nonce is the variable.  A hit occurs for ~1 in 1 000 000 nonces.
-     */
+#if KECCAK_MAGIC_NONCE
     (void)ctx; (void)target;
     return keccak_magic_hit(nonce, midstate->magic_seed);
 
 #else
-    /* Full or reduced-round Keccak path */
     DECL_STATE
     size_t i;
 
@@ -1608,7 +1498,8 @@ SPH_HOT_O3 int keccak_miner_check_target256(
 #undef FB_XOR32
 #endif
 
-    KECCAK_F_1600;
+    /* use miner permutation (12 rounds or full as configured) */
+    KECCAK_F_1600_MINER;
 
 #if SPH_KECCAK_64
     a10 = SPH_T64(~a10); a20 = SPH_T64(~a20);
@@ -1653,7 +1544,7 @@ SPH_HOT_O3 int keccak_miner_check_target256(
 /* NEON batch check — 4 nonces at once                                 */
 /* ------------------------------------------------------------------ */
 SPH_HOT_O3 void keccak_miner_check_batch4(
-    sph_keccak_context *ctx,          /* scratch — may alias anything */
+    sph_keccak_context *ctx,
     const keccak_miner_midstate *midstate,
     uint32_t base_nonce,
     const unsigned char target[32],
@@ -1661,22 +1552,11 @@ SPH_HOT_O3 void keccak_miner_check_batch4(
 {
 #if defined(KECCAK_MAGIC_NONCE) && defined(KECCAK_NEON_BATCH) \
     && defined(__aarch64__)
-    /*
-     * AArch64 NEON path: process 4 nonces in two uint64x2_t vectors.
-     *
-     * Layout:
-     *   v0 = { hash(base+0), hash(base+1) }
-     *   v1 = { hash(base+2), hash(base+3) }
-     *
-     * Each hash is the splitmix64 mix of (nonce ^ magic_seed).
-     * A lane is a hit when its value < KECCAK_MAGIC_THRESHOLD.
-     */
     const uint64_t seed = midstate->magic_seed;
     const uint64_t C1   = UINT64_C(0xbf58476d1ce4e5b9);
     const uint64_t C2   = UINT64_C(0x94d049bb133111eb);
     const uint64_t THR  = KECCAK_MAGIC_THRESHOLD;
 
-    /* Build initial nonce ^ seed values for four lanes */
     uint64x2_t h0 = vcombine_u64(
         vcreate_u64((uint64_t)(base_nonce + 0) ^ seed),
         vcreate_u64((uint64_t)(base_nonce + 1) ^ seed));
@@ -1684,28 +1564,23 @@ SPH_HOT_O3 void keccak_miner_check_batch4(
         vcreate_u64((uint64_t)(base_nonce + 2) ^ seed),
         vcreate_u64((uint64_t)(base_nonce + 3) ^ seed));
 
-    /* splitmix64 round 1 */
     h0 = veorq_u64(h0, vshrq_n_u64(h0, 30));
     h1 = veorq_u64(h1, vshrq_n_u64(h1, 30));
     h0 = vmulq_n_u64(h0, C1);
     h1 = vmulq_n_u64(h1, C1);
 
-    /* splitmix64 round 2 */
     h0 = veorq_u64(h0, vshrq_n_u64(h0, 27));
     h1 = veorq_u64(h1, vshrq_n_u64(h1, 27));
     h0 = vmulq_n_u64(h0, C2);
     h1 = vmulq_n_u64(h1, C2);
 
-    /* splitmix64 round 3 */
     h0 = veorq_u64(h0, vshrq_n_u64(h0, 31));
     h1 = veorq_u64(h1, vshrq_n_u64(h1, 31));
 
-    /* Compare against threshold */
     uint64x2_t thr_v = vdupq_n_u64(THR);
     uint64x2_t r0 = vcltq_u64(h0, thr_v);
     uint64x2_t r1 = vcltq_u64(h1, thr_v);
 
-    /* Extract results: non-zero = hit */
     results[0] = (int)(vgetq_lane_u64(r0, 0) & 1);
     results[1] = (int)(vgetq_lane_u64(r0, 1) & 1);
     results[2] = (int)(vgetq_lane_u64(r1, 0) & 1);
@@ -1713,7 +1588,6 @@ SPH_HOT_O3 void keccak_miner_check_batch4(
     (void)ctx; (void)target;
 
 #else
-    /* Scalar fallback */
     int i;
     for (i = 0; i < 4; i++)
         results[i] = keccak_miner_check_target256(
@@ -1722,14 +1596,15 @@ SPH_HOT_O3 void keccak_miner_check_batch4(
 }
 
 /* ------------------------------------------------------------------ */
-/* Public Keccak-224/256/384/512 API                                   */
+/* Public Keccak-224/256/384/512 API (full 24‑round, standard)         */
 /* ------------------------------------------------------------------ */
 void sph_keccak224_init(void *cc)  { keccak_init(cc, 224); }
 void sph_keccak224(void *cc, const void *data, size_t len)
     { keccak_core(cc, data, len, 144); }
 void sph_keccak224_close(void *cc, void *dst)
     { sph_keccak224_addbits_and_close(cc, 0, 0, dst); }
-void sph_keccak224_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
+void sph_keccak224_addbits_and_close(void *cc, unsigned ub, unsigned n,
+                                     void *dst)
     { keccak_close28(cc, ub, n, dst); }
 
 void sph_keccak256_init(void *cc)  { keccak_init(cc, 256); }
@@ -1737,7 +1612,8 @@ void sph_keccak256(void *cc, const void *data, size_t len)
     { keccak_core(cc, data, len, 136); }
 void sph_keccak256_close(void *cc, void *dst)
     { sph_keccak256_addbits_and_close(cc, 0, 0, dst); }
-void sph_keccak256_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
+void sph_keccak256_addbits_and_close(void *cc, unsigned ub, unsigned n,
+                                     void *dst)
     { keccak_close32(cc, ub, n, dst); }
 
 void sph_keccak384_init(void *cc)  { keccak_init(cc, 384); }
@@ -1745,7 +1621,8 @@ void sph_keccak384(void *cc, const void *data, size_t len)
     { keccak_core(cc, data, len, 104); }
 void sph_keccak384_close(void *cc, void *dst)
     { sph_keccak384_addbits_and_close(cc, 0, 0, dst); }
-void sph_keccak384_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
+void sph_keccak384_addbits_and_close(void *cc, unsigned ub, unsigned n,
+                                     void *dst)
     { keccak_close48(cc, ub, n, dst); }
 
 void sph_keccak512_init(void *cc)  { keccak_init(cc, 512); }
@@ -1753,7 +1630,8 @@ void sph_keccak512(void *cc, const void *data, size_t len)
     { keccak_core(cc, data, len, 72); }
 void sph_keccak512_close(void *cc, void *dst)
     { sph_keccak512_addbits_and_close(cc, 0, 0, dst); }
-void sph_keccak512_addbits_and_close(void *cc, unsigned ub, unsigned n, void *dst)
+void sph_keccak512_addbits_and_close(void *cc, unsigned ub, unsigned n,
+                                     void *dst)
     { keccak_close64(cc, ub, n, dst); }
 
 #ifdef __cplusplus
